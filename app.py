@@ -10,6 +10,7 @@ app.py
 from __future__ import annotations
 import base64
 import copy
+import math
 import streamlit as st
 
 import presets
@@ -17,6 +18,7 @@ from aircraft import (aircraft_from_dict, environment_from_dict,
                       initial_from_dict, sim_from_dict)
 import simulation
 import analysis
+import physics
 import visualization as viz
 import animation
 import stl_analysis
@@ -166,7 +168,28 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 keys = ["length", "span", "height", "S_wing", "wing_pos", "cp_base",
                         "cg", "S_htail", "htail_arm", "S_vtail", "vtail_arm",
                         "Ix", "Iy", "Iz"]
-                st.session_state["_stl_props"] = {k: float(props[k]) for k in keys}
+                geo = {k: float(props[k]) for k in keys}
+                # STL 적용 시 CP 고정(자동이동 OFF): AoA 의존 CP 이동이
+                # 영양력각 부근에서 강성 부호를 바꿔 한쪽으로 발산시키는 것을 방지
+                geo["cp_auto"] = False
+
+                # 새 형상(관성·강성)에 맞는 감쇠 자동 산출 → 발산/과감쇠 방지
+                merged = {k: st.session_state[k] for k in INPUT_KEYS}
+                merged.update(geo)
+                merged["name"] = "stl"
+                ac_t = aircraft_from_dict(merged)
+                env_t = environment_from_dict(merged)
+                k_th_signed = physics.pitch_stiffness(ac_t, env_t, 0.0)
+                k_th = max(abs(k_th_signed), 1e-12)
+                k_ps = max(abs(physics.yaw_stiffness(ac_t, env_t)), 1e-12)
+                zeta = 0.35   # 목표 감쇠비(가볍게 진동하며 수렴)
+                geo["cd_pitch"] = 2 * zeta * math.sqrt(k_th * geo["Iy"])
+                geo["cd_yaw"] = 2 * zeta * math.sqrt(k_ps * geo["Iz"])
+                geo["cd_roll"] = geo["Ix"] * 3.0   # roll 복원 없음 → 시간상수 기반
+
+                props["k_theta"] = k_th_signed
+                props["static_margin"] = geo["cp_base"] - geo["cg"]
+                st.session_state["_stl_props"] = geo
                 st.session_state["_apply_stl"] = True
                 st.session_state["_stl_report"] = props
                 st.rerun()
@@ -181,6 +204,13 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 f"- 주날개 면적 {rp['S_wing']:.3g} m² · 수평꼬리 {rp['S_htail']:.2g} m²\n"
                 f"- CG {rp['cg']:.3g} m · CP {rp['cp_base']:.3g} m (기수 기준)\n"
                 f"- Ix {rp['Ix']:.2e} · Iy {rp['Iy']:.2e} · Iz {rp['Iz']:.2e} kg·m²")
+            if rp.get("k_theta", 1) <= 0:
+                st.warning(
+                    "⚠️ 이 형상은 **정적으로 불안정**(양력중심이 무게중심보다 앞)하여 "
+                    "기수가 점점 들리거나 숙여지며 **발산**합니다. 실제 모형도 이대로면 뒤집힙니다.\n\n"
+                    "→ **무게중심(CG)을 앞으로** 옮기세요(기수에 무게추). 사이드바 ‘무게중심 CG’ 값을 "
+                    f"현재 CP({rp['cp_base']:.3g} m)보다 **작게**(앞으로) 조정한 뒤 다시 시작하면 안정화됩니다. "
+                    "(균일밀도 가정이라 실제 무게추 위치와 다를 수 있어요.)")
         st.caption("① 기수/위 축을 모델에 맞게 고르고 → ② **‘질량(kg)’** 을 먼저 입력한 뒤 → "
                    "③ **‘적용’** 을 누르면 길이·면적·CG·CP·관성이 자동 반영됩니다. "
                    "이후 **▶ 시뮬레이션 시작/재시작**.")

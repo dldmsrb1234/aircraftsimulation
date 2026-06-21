@@ -170,9 +170,14 @@ def analyze(tris: np.ndarray, fwd: str, up: str, mass: float) -> dict:
     if S_wing <= 1e-9:                          # 분리 실패 시 전체를 주날개로
         S_wing, S_htail = S_plan, 0.0
 
-    # planform 면적 중심 → CP 근사 (전체 양력면 기준)
-    wsum = up_area.sum()
-    cpx = float((up_area * cen[:, 0]).sum() / wsum) if wsum > 1e-9 else 0.5 * (mn[0] + mx[0])
+    # CP 근사 = 주날개(앞 영역) planform 면적 중심 (양력 위치와 면적을 일관되게)
+    wf = up_area * (~aft)
+    wsum = float(wf.sum())
+    if wsum > 1e-9:
+        cpx = float((wf * cen[:, 0]).sum() / wsum)
+    else:
+        tot = float(up_area.sum())
+        cpx = float((up_area * cen[:, 0]).sum() / tot) if tot > 1e-9 else 0.5 * (mn[0] + mx[0])
     x_cp = nose - cpx
 
     # 주날개 위치(앞 영역 면적중심)

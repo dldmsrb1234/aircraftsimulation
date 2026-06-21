@@ -66,19 +66,31 @@ def run_simulation(ac: Aircraft, env: Environment,
     cd_r = ac.cd_roll * sim.damping_mult
     cd_y = ac.cd_yaw * sim.damping_mult
 
+    # 수치 안정성: 내부 서브스텝
+    #   고유진동수 ω=√(k/I) 가 크면(작은 모델 등) ω·h<1.5 가 되도록 dt 를 잘게 쪼갠다.
+    #   감쇠는 아래 적분에서 '암시적'으로 처리하므로 감쇠가 커도 발산하지 않는다.
+    k_th = abs(physics.pitch_stiffness(ac, env, 0.0))
+    k_ps = abs(physics.yaw_stiffness(ac, env))
+    w_pitch = math.sqrt(k_th / ac.Iy) if ac.Iy > 0 else 0.0
+    w_yaw = math.sqrt(k_ps / ac.Iz) if ac.Iz > 0 else 0.0
+    w_max = max(w_pitch, w_yaw, 1e-9)
+    n_sub = int(min(200, max(1, math.ceil(sim.dt * w_max / 1.5))))
+    h = sim.dt / n_sub
+
     # 기록 버퍼
     rec = {k: np.zeros(n) for k in (
         "t", "pitch", "roll", "yaw", "aoa", "cp",
         "L_wing", "L_tail", "M_pitch", "M_roll", "M_yaw",
         "pitch_rate", "roll_rate", "yaw_rate")}
 
+    LO_T, HI_T, LIM = math.radians(-90), math.radians(90), math.radians(180)
+
     for i in range(n):
-        # --- 현재 상태에서의 공력/모멘트 ---
+        # --- 현재 상태에서의 공력/모멘트 (기록용) ---
         ps = physics.pitch_state(ac, env, theta)
         rs = physics.roll_moment(ac, env, phi)
         ys = physics.yaw_moment(ac, env, psi)
 
-        # --- 기록 ---
         rec["t"][i] = i * sim.dt
         rec["pitch"][i] = math.degrees(theta)
         rec["roll"][i] = math.degrees(phi)
@@ -94,23 +106,22 @@ def run_simulation(ac: Aircraft, env: Environment,
         rec["roll_rate"][i] = math.degrees(p_rate)
         rec["yaw_rate"][i] = math.degrees(r_rate)
 
-        # --- 각가속도 (감쇠 포함) ---
-        ang_acc_p = (ps["M_pitch"] - cd_p * q_rate) / ac.Iy
-        ang_acc_r = (rs["M_roll"] - cd_r * p_rate) / ac.Ix
-        ang_acc_y = (ys["M_yaw"] - cd_y * r_rate) / ac.Iz
-
-        # --- 적분 (오일러) ---
-        q_rate += ang_acc_p * sim.dt
-        p_rate += ang_acc_r * sim.dt
-        r_rate += ang_acc_y * sim.dt
-        theta += q_rate * sim.dt
-        phi += p_rate * sim.dt
-        psi += r_rate * sim.dt
-
-        # 수치 발산 보호 (과도 발산 시 클램프)
-        theta = float(np.clip(theta, math.radians(-90), math.radians(90)))
-        phi = float(np.clip(phi, math.radians(-180), math.radians(180)))
-        psi = float(np.clip(psi, math.radians(-180), math.radians(180)))
+        # --- dt 를 n_sub 개의 반암시적 스텝으로 적분 ---
+        #   각속도: rate_new = (rate + (M/I)·h) / (1 + (c/I)·h)
+        #   → 감쇠 항이 분모로 들어가 c 가 아무리 커도 |계수|<1 (무조건 안정)
+        for _ in range(n_sub):
+            mp = physics.pitch_state(ac, env, theta)["M_pitch"]
+            mr = physics.roll_moment(ac, env, phi)["M_roll"]
+            my = physics.yaw_moment(ac, env, psi)["M_yaw"]
+            q_rate = (q_rate + (mp / ac.Iy) * h) / (1.0 + (cd_p / ac.Iy) * h)
+            p_rate = (p_rate + (mr / ac.Ix) * h) / (1.0 + (cd_r / ac.Ix) * h)
+            r_rate = (r_rate + (my / ac.Iz) * h) / (1.0 + (cd_y / ac.Iz) * h)
+            theta += q_rate * h
+            phi += p_rate * h
+            psi += r_rate * h
+            theta = LO_T if theta < LO_T else (HI_T if theta > HI_T else theta)
+            phi = -LIM if phi < -LIM else (LIM if phi > LIM else phi)
+            psi = -LIM if psi < -LIM else (LIM if psi > LIM else psi)
 
     return SimResult(
         t=rec["t"], pitch=rec["pitch"], roll=rec["roll"], yaw=rec["yaw"],
