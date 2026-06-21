@@ -10,6 +10,7 @@ app.py
 from __future__ import annotations
 import base64
 import copy
+import hashlib
 import math
 import numpy as np
 import streamlit as st
@@ -34,6 +35,11 @@ _META = {"name", "_preset", "V_default_fast"}
 INPUT_KEYS = [k for k in presets.CUSTOM.keys() if k not in _META]
 
 LEVEL_COLOR = {"ok": "#2e7d32", "warn": "#ef6c00", "danger": "#c62828"}
+STL_QUALITY = {
+    "빠름": dict(n_alpha=27, n_beta=11, max_tris=30000, occlusion=False, shadow_bins=0),
+    "기본": dict(n_alpha=41, n_beta=17, max_tris=60000, occlusion=True, shadow_bins=80),
+    "정밀": dict(n_alpha=61, n_beta=25, max_tris=100000, occlusion=True, shadow_bins=120),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -54,6 +60,22 @@ def badge(text: str, level: str) -> str:
             f"border-radius:12px;font-size:0.85em;white-space:nowrap'>{text}</span>")
 
 
+def stl_signature(raw: bytes, fwd: str, up: str, unit_label: str,
+                  physics_scale: float, quality: str) -> str:
+    h = hashlib.sha1(raw).hexdigest()[:16]
+    return f"{h}:{fwd}:{up}:{unit_label}:{physics_scale:.6g}:{quality}"
+
+
+def inertia_with_cg_override(props: dict, mass: float, cg_from_nose: float) -> tuple[float, float, float]:
+    """균일밀도 CM 기준 관성을 사용자가 고른 CG 기준으로 이동."""
+    dx = float(cg_from_nose) - float(props["cg"])
+    return (
+        max(float(props["Ix"]), 1e-9),
+        max(float(props["Iy"]) + mass * dx * dx, 1e-9),
+        max(float(props["Iz"]) + mass * dx * dx, 1e-9),
+    )
+
+
 def compute(cur: dict, aero_model=None):
     ac = aircraft_from_dict(cur)
     env = environment_from_dict(cur)
@@ -68,8 +90,19 @@ def compute(cur: dict, aero_model=None):
             aero_err = f"{type(e).__name__}: {e}"
     if res is None:
         res = simulation.run_simulation(ac, env, init, sim, aero_model=None)
-    assess = analysis.overall_assessment(ac, env, res)
     used_aero = (aero_model is not None and aero_err is None)
+    k_theta_override = None
+    k_psi_override = None
+    if used_aero:
+        try:
+            q_dyn = physics.dynamic_pressure(env.rho, env.V)
+            cgp = panel_aero.cg_point_from_nose(aero_model, ac.cg)
+            k_theta_override = panel_aero.pitch_stiffness(aero_model, q_dyn, cgp)
+            k_psi_override = panel_aero.yaw_stiffness(aero_model, q_dyn, cgp)
+        except Exception:
+            k_theta_override = None
+            k_psi_override = None
+    assess = analysis.overall_assessment(ac, env, res, k_theta_override, k_psi_override)
     return {"ac": ac, "env": env, "res": res, "assess": assess,
             "cur": copy.deepcopy(cur),
             "aero": used_aero, "aero_err": aero_err,
@@ -143,9 +176,9 @@ with st.sidebar.expander("🎯 초기 자세 / 각속도"):
     st.slider("초기 yaw 각속도 (deg/s)", -60.0, 60.0, step=1.0, key="r0")
 
 with st.sidebar.expander("🔧 관성 / 감쇠 / 시간 (심화)"):
-    st.number_input("Ix (roll 관성)", min_value=0.0, key="Ix", format="%.4g")
-    st.number_input("Iy (pitch 관성)", min_value=0.0, key="Iy", format="%.4g")
-    st.number_input("Iz (yaw 관성)", min_value=0.0, key="Iz", format="%.4g")
+    st.number_input("Ix (roll 관성)", min_value=1e-9, key="Ix", format="%.4g")
+    st.number_input("Iy (pitch 관성)", min_value=1e-9, key="Iy", format="%.4g")
+    st.number_input("Iz (yaw 관성)", min_value=1e-9, key="Iz", format="%.4g")
     st.number_input("pitch 감쇠 기준 cd_pitch", min_value=0.0, key="cd_pitch", format="%.4g")
     st.number_input("roll 감쇠 기준 cd_roll", min_value=0.0, key="cd_roll", format="%.4g")
     st.number_input("yaw 감쇠 기준 cd_yaw", min_value=0.0, key="cd_yaw", format="%.4g")
@@ -155,6 +188,7 @@ with st.sidebar.expander("🔧 관성 / 감쇠 / 시간 (심화)"):
 
 stl_b64 = ""
 stl_fwd, stl_up = "+X", "+Y"
+stl_sig_current = None
 _UNIT = {"mm (밀리미터)": 0.001, "cm (센티미터)": 0.01, "m (미터)": 1.0}
 with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
     up = st.file_uploader("STL 파일 (.stl) 업로드", type=["stl"], key="stl_upload")
@@ -162,6 +196,23 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
     stl_fwd = c_f.selectbox("기수(앞) 축", stl_analysis.AXIS_NAMES, index=0, key="stl_fwd")
     stl_up = c_u.selectbox("위(상단) 축", stl_analysis.AXIS_NAMES, index=2, key="stl_up")
     unit_label = st.selectbox("STL 단위", list(_UNIT.keys()), index=0, key="stl_unit")
+    stl_mass = st.number_input(
+        "적용 전 질량 (kg)", min_value=0.001,
+        value=float(st.session_state.get("stl_mass_input", st.session_state["mass"])),
+        key="stl_mass_input", format="%.3f")
+    stl_physics_scale = st.slider(
+        "물리 크기 배율 (ray/면적/관성에 반영)", 0.10, 5.00, step=0.05,
+        value=float(st.session_state.get("stl_physics_scale", 1.0)),
+        key="stl_physics_scale")
+    stl_cg_mode = st.selectbox(
+        "무게중심(CG) 지정", ["STL 균일밀도 자동", "현재 입력 CG 사용", "기수 기준 비율", "기수 기준 거리(m)"],
+        key="stl_cg_mode")
+    stl_cg_ratio = st.slider("CG 위치 (% 기체 길이, 기수=0)", 0.0, 100.0, 35.0, step=1.0,
+                             key="stl_cg_ratio") if stl_cg_mode == "기수 기준 비율" else None
+    stl_cg_m = st.number_input("CG 위치 (기수 기준, m)", min_value=0.0,
+                               value=float(st.session_state.get("stl_cg_m", st.session_state["cg"])),
+                               key="stl_cg_m", format="%.4f") if stl_cg_mode == "기수 기준 거리(m)" else None
+    stl_quality = st.selectbox("ray 물리 정밀도", list(STL_QUALITY.keys()), index=1, key="stl_quality")
 
     if up is not None:
         raw = up.getvalue()
@@ -172,46 +223,74 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
         if mb > 6:
             st.warning("파일이 큽니다(>6MB). 렌더가 느릴 수 있어요. "
                        "이진(binary) STL / 폴리곤 수 줄인 모델 권장.")
+        axis_ok = True
+        try:
+            stl_analysis.align_matrix(stl_fwd, stl_up)
+        except ValueError as e:
+            axis_ok = False
+            st.error(str(e))
 
-        if st.button("📐 STL 형상의 항공역학 특성 적용", width='stretch'):
+        stl_sig_current = stl_signature(raw, stl_fwd, stl_up, unit_label,
+                                        stl_physics_scale, stl_quality)
+        applied_sig = st.session_state.get("_aero_signature")
+        if applied_sig and applied_sig != stl_sig_current:
+            st.info("STL 파일/축/단위/물리 크기/정밀도 설정이 바뀌었습니다. "
+                    "ray 물리에 반영하려면 아래 적용 버튼을 다시 누르세요.")
+
+        if st.button("📐 STL 형상의 항공역학 특성 적용", width='stretch',
+                     disabled=not axis_ok):
             try:
-                factor = _UNIT[unit_label]
+                factor = _UNIT[unit_label] * float(stl_physics_scale)
                 tris = stl_analysis.parse_stl(raw) * factor
                 props = stl_analysis.analyze(tris, stl_fwd, stl_up,
-                                             float(st.session_state["mass"]))
+                                             float(stl_mass))
+                if stl_cg_mode == "현재 입력 CG 사용":
+                    cg_from_nose = float(st.session_state["cg"])
+                elif stl_cg_mode == "기수 기준 비율":
+                    cg_from_nose = float(props["length"]) * float(stl_cg_ratio) / 100.0
+                elif stl_cg_mode == "기수 기준 거리(m)":
+                    cg_from_nose = float(stl_cg_m)
+                else:
+                    cg_from_nose = float(props["cg"])
+                if not (0.0 <= cg_from_nose <= float(props["length"])):
+                    raise ValueError(
+                        f"CG는 0~{props['length']:.3g} m 범위 안이어야 합니다.")
+
+                Ix, Iy, Iz = inertia_with_cg_override(props, float(stl_mass), cg_from_nose)
                 keys = ["length", "span", "height", "S_wing", "wing_pos", "cp_base",
-                        "cg", "S_htail", "htail_arm", "S_vtail", "vtail_arm",
-                        "Ix", "Iy", "Iz"]
+                        "S_htail", "htail_arm", "S_vtail", "vtail_arm"]
                 geo = {k: float(props[k]) for k in keys}
+                geo["mass"] = float(stl_mass)
+                geo["cg"] = cg_from_nose
+                geo["Ix"], geo["Iy"], geo["Iz"] = Ix, Iy, Iz
                 # STL 적용 시 CP 고정(자동이동 OFF): AoA 의존 CP 이동이
                 # 영양력각 부근에서 강성 부호를 바꿔 한쪽으로 발산시키는 것을 방지
                 geo["cp_auto"] = False
 
-                # 새 형상(관성·강성)에 맞는 감쇠 자동 산출 → 발산/과감쇠 방지
-                merged = {k: st.session_state[k] for k in INPUT_KEYS}
-                merged.update(geo)
-                merged["name"] = "stl"
-                ac_t = aircraft_from_dict(merged)
-                env_t = environment_from_dict(merged)
-                k_th_signed = physics.pitch_stiffness(ac_t, env_t, 0.0)
-                k_th = max(abs(k_th_signed), 1e-12)
-                k_ps = max(abs(physics.yaw_stiffness(ac_t, env_t)), 1e-12)
-                zeta = 0.35   # 목표 감쇠비(가볍게 진동하며 수렴)
-                geo["cd_pitch"] = 2 * zeta * math.sqrt(k_th * geo["Iy"])
-                geo["cd_yaw"] = 2 * zeta * math.sqrt(k_ps * geo["Iz"])
-                geo["cd_roll"] = geo["Ix"] * 3.0   # roll 복원 없음 → 시간상수 기반
-
                 # 표면 패널 공력 모델 생성(정렬 메시 + 무게중심점)
                 V = stl_analysis.align_mesh(tris, stl_fwd, stl_up)
-                aero_model = panel_aero.build_aero_model(V, np.asarray(props["cm"]))
+                aero_model = panel_aero.build_aero_model(
+                    V, np.asarray(props["cm"]), **STL_QUALITY[stl_quality])
                 q0 = 0.5 * float(st.session_state["rho"]) * float(st.session_state["V"]) ** 2
                 cgp = panel_aero.cg_point_from_nose(aero_model, geo["cg"])
                 props["k_theta_panel"] = panel_aero.pitch_stiffness(aero_model, q0, cgp)
                 props["k_psi_panel"] = panel_aero.yaw_stiffness(aero_model, q0, cgp)
+                k_th = max(abs(props["k_theta_panel"]), 1e-12)
+                k_ps = max(abs(props["k_psi_panel"]), 1e-12)
+                zeta = 0.38   # 목표 감쇠비(가볍게 진동하며 수렴)
+                geo["cd_pitch"] = 2 * zeta * math.sqrt(k_th * geo["Iy"])
+                geo["cd_yaw"] = 2 * zeta * math.sqrt(k_ps * geo["Iz"])
+                geo["cd_roll"] = geo["Ix"] * 3.0   # roll 복원 없음 → 시간상수 기반
 
-                props["k_theta"] = k_th_signed
+                props["cg_auto"] = float(props["cg"])
+                props["cg_applied"] = float(cg_from_nose)
+                props["mass"] = float(stl_mass)
+                props["Ix"], props["Iy"], props["Iz"] = geo["Ix"], geo["Iy"], geo["Iz"]
                 props["static_margin"] = geo["cp_base"] - geo["cg"]
+                props["physics_scale"] = float(stl_physics_scale)
+                props["quality"] = stl_quality
                 st.session_state["_aero_model"] = aero_model
+                st.session_state["_aero_signature"] = stl_sig_current
                 st.session_state["_stl_props"] = geo
                 st.session_state["_apply_stl"] = True
                 st.session_state["_stl_report"] = props
@@ -223,22 +302,24 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
         rp = st.session_state.get("_stl_report")
         if rp:
             st.success(
-                f"추출됨(형상 기반 추정) · 삼각형 {rp['n_tri']:,}개\n\n"
+                f"추출됨(형상 기반 추정) · 삼각형 {rp['n_tri']:,}개 · ray {rp.get('quality', '기본')}\n\n"
                 f"- 길이 {rp['length']:.3g} m · 날개폭 {rp['span']:.3g} m · 높이 {rp['height']:.3g} m\n"
                 f"- 주날개 면적 {rp['S_wing']:.3g} m² · 수평꼬리 {rp['S_htail']:.2g} m²\n"
-                f"- CG {rp['cg']:.3g} m · CP {rp['cp_base']:.3g} m (기수 기준)\n"
+                f"- CG {rp.get('cg_applied', rp['cg']):.3g} m "
+                f"(자동 추정 {rp.get('cg_auto', rp['cg']):.3g} m) · CP {rp['cp_base']:.3g} m\n"
+                f"- 물리 크기 배율 {rp.get('physics_scale', 1.0):.2f}×\n"
                 f"- Ix {rp['Ix']:.2e} · Iy {rp['Iy']:.2e} · Iz {rp['Iz']:.2e} kg·m²\n"
                 f"- 표면 패널 공력 적용(세로강성 k_θ={rp.get('k_theta_panel', 0):.2f}, "
                 f"방향강성 k_ψ={rp.get('k_psi_panel', 0):.2f})")
-            if rp.get("k_theta_panel", rp.get("k_theta", 1)) <= 0:
+            if rp.get("k_theta_panel", 1) <= 0:
                 st.warning(
                     "⚠️ 이 형상은 **세로 정적 불안정**(무게중심이 양력중심보다 뒤)하여 "
                     "기수가 점점 들리거나 숙여지며 **발산**합니다. 실제 모형도 이대로면 뒤집힙니다.\n\n"
                     "→ **무게중심(CG)을 앞으로** 옮기세요(기수에 무게추). 사이드바 ‘무게중심 CG’ 값을 "
                     f"현재 CP({rp['cp_base']:.3g} m)보다 **작게**(앞으로) 조정한 뒤 다시 시작하면 안정화됩니다. "
                     "(균일밀도 가정이라 실제 무게추 위치와 다를 수 있어요.)")
-        st.caption("① 기수/위 축을 모델에 맞게 고르고 → ② **‘질량(kg)’** 을 먼저 입력한 뒤 → "
-                   "③ **‘적용’** 을 누르면 길이·면적·CG·CP·관성이 자동 반영됩니다. "
+        st.caption("① 기수/위 축·단위·질량·물리 크기·CG 를 먼저 정하고 → "
+                   "② **‘적용’** 을 누르면 길이·면적·CG·CP·관성·ray 공력표가 함께 반영됩니다. "
                    "이후 **▶ 시뮬레이션 시작/재시작**.")
     else:
         st.caption("업로드하지 않으면 기본 내장 항공기 모델을 사용합니다. "
@@ -257,8 +338,18 @@ cur["name"] = preset_name
 # 시뮬레이션 실행 결정
 # ---------------------------------------------------------------------------
 # STL 을 사용 중이고 패널 공력 모델이 있으면 그것으로 동역학 계산
-aero_model = st.session_state.get("_aero_model") if stl_b64 else None
-need = (st.session_state.get("sim") is None) or run_clicked or auto
+aero_ready = (
+    bool(stl_b64)
+    and st.session_state.get("_aero_model") is not None
+    and st.session_state.get("_aero_signature") == stl_sig_current
+)
+stl_settings_pending = (
+    bool(stl_b64)
+    and st.session_state.get("_aero_signature") is not None
+    and st.session_state.get("_aero_signature") != stl_sig_current
+)
+aero_model = st.session_state.get("_aero_model") if aero_ready else None
+need = (st.session_state.get("sim") is None) or run_clicked or auto or stl_settings_pending
 if need:
     st.session_state["sim"] = compute(cur, aero_model)
 
@@ -276,6 +367,10 @@ st.caption("받음각·무게중심·양력중심·꼬리날개 조건에 따른
 if pending_changed:
     st.info("입력값이 바뀌었습니다. 좌측 **▶ 시뮬레이션 시작/재시작** 을 눌러 반영하세요. "
             "(현재 화면은 직전에 계산된 결과입니다.)")
+
+if stl_settings_pending:
+    st.info("STL 설정이 마지막 적용값과 달라 현재 ray 패널 공력은 비활성화했습니다. "
+            "사이드바에서 **STL 형상의 항공역학 특성 적용** 을 다시 누르면 새 설정으로 계산합니다.")
 
 if sim_data.get("aero_err"):
     st.error("⚠️ STL 표면 패널 공력 계산 중 오류가 발생해 매개변수 모델로 대체했습니다. "

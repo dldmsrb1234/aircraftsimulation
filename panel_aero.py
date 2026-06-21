@@ -27,8 +27,9 @@ from __future__ import annotations
 import math
 import numpy as np
 
-CW = 3.2        # windward(양압) 기울기
-CL_SUC = 1.1    # leeward(흡입) 기울기
+CW = 2.9         # windward(양압) 기울기
+CL_SUC = 0.75    # leeward(흡입) 기울기
+CD_SKIN = 0.018  # 표면 마찰/형상 drag 보정(동압 q 당)
 
 
 def _ensure_outward(tris: np.ndarray) -> np.ndarray:
@@ -55,6 +56,58 @@ def _dir(al, be):
     return d / np.linalg.norm(d)
 
 
+def _pressure_cp(m: np.ndarray) -> np.ndarray:
+    """패널 입사계수 m=-(n·d)를 압력계수로 변환.
+
+    작은 각도에서는 거의 선형으로 반응하고, 큰 각도에서는 impact 항이 더 강해지게
+    섞어 평판 저각/고각 거동이 모두 너무 둔해지지 않도록 한다.
+    """
+    a = np.abs(m)
+    shape = m * (0.42 + 0.58 * a)
+    return np.where(m >= 0.0, CW * shape, CL_SUC * shape)
+
+
+def _perp_basis(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """기류 방향 d 에 수직인 투영 평면 기저."""
+    ref = np.array([0.0, 1.0, 0.0])
+    if abs(float(np.dot(ref, d))) > 0.9:
+        ref = np.array([0.0, 0.0, 1.0])
+    u = np.cross(d, ref)
+    u = u / max(float(np.linalg.norm(u)), 1e-12)
+    v = np.cross(d, u)
+    v = v / max(float(np.linalg.norm(v)), 1e-12)
+    return u, v
+
+
+def _visible_mask(cen: np.ndarray, area: np.ndarray, d: np.ndarray,
+                  bins: int = 80) -> np.ndarray:
+    """기류 방향에서 보이는 앞쪽 패널 근사.
+
+    삼각형 중심을 기류 수직 평면에 투영한 뒤 같은 셀 안에서 가장 앞쪽
+    depth 를 가진 패널을 ray 가 먼저 만나는 면으로 본다. 완전한 BVH ray trace는
+    아니지만, 동체 내부/뒤쪽 windward 면이 중복으로 힘을 만드는 문제를 줄인다.
+    """
+    if bins <= 0 or len(cen) == 0:
+        return np.ones(len(cen), dtype=bool)
+    u, v = _perp_basis(d)
+    pu, pv = cen @ u, cen @ v
+    du, dv = float(pu.max() - pu.min()), float(pv.max() - pv.min())
+    if du < 1e-12 or dv < 1e-12:
+        return np.ones(len(cen), dtype=bool)
+
+    bu = np.clip(((pu - pu.min()) / du * bins).astype(int), 0, bins - 1)
+    bv = np.clip(((pv - pv.min()) / dv * bins).astype(int), 0, bins - 1)
+    key = bu * bins + bv
+    depth = cen @ d
+    nearest = np.full(bins * bins, np.inf)
+    np.minimum.at(nearest, key, depth)
+
+    cell = max(du, dv) / bins
+    tri = float(np.sqrt(max(float(np.mean(area)), 1e-16)))
+    tol = max(cell * 0.65, tri * 0.75, 1e-8)
+    return depth <= nearest[key] + tol
+
+
 def ab_from_wind(w):
     """기체프레임 상대풍 단위벡터 → (α, β) [rad]."""
     dx, dy, dz = float(w[0]), float(w[1]), float(w[2])
@@ -62,9 +115,11 @@ def ab_from_wind(w):
 
 
 def build_aero_model(tris: np.ndarray, cm: np.ndarray,
-                     n_alpha: int = 27, n_beta: int = 11,
+                     n_alpha: int = 41, n_beta: int = 17,
                      a_max: float = 45.0, b_max: float = 35.0,
-                     max_tris: int = 60000) -> dict:
+                     max_tris: int = 60000,
+                     occlusion: bool = True,
+                     shadow_bins: int = 80) -> dict:
     """패널 공력 표 생성. 모멘트는 **원점 기준**(Fg, Mg 모두 동압 q 당)으로 저장하여
     실행 시 임의의 무게중심에 대해 M_cg = M_origin − cg×F 로 옮길 수 있게 한다.
 
@@ -85,15 +140,22 @@ def build_aero_model(tris: np.ndarray, cm: np.ndarray,
         for j, be in enumerate(betas):
             d = _dir(al, be)
             m = -(nhat @ d)                         # >0 windward
-            Cp = np.where(m > 0.0, CW * m, CL_SUC * m)
+            Cp = _pressure_cp(m)
+            if occlusion:
+                visible = _visible_mask(cen, area, d, shadow_bins)
+                Cp = np.where((m > 0.0) & (~visible), 0.0, Cp)
+            else:
+                visible = np.ones(len(area), dtype=bool)
             f = (-(Cp * area))[:, None] * nhat      # q 당 패널 힘
+            f += (CD_SKIN * area * visible)[:, None] * d
             Fg[i, j] = f.sum(0)
             Mg[i, j] = np.cross(cen, f).sum(0)      # 원점 기준 모멘트
 
     return {"alphas": alphas, "betas": betas, "Fg": Fg, "Mg": Mg,
             "ref_area": float(area.sum()), "n_tri": int(len(tris)),
             "nose_x": float(tris[:, :, 0].max()),
-            "cm": [float(c) for c in np.asarray(cm)]}
+            "cm": [float(c) for c in np.asarray(cm)],
+            "occlusion": bool(occlusion), "shadow_bins": int(shadow_bins)}
 
 
 def _bilinear(grid, alphas, betas, al, be):

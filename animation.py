@@ -65,7 +65,8 @@ def _build_dyn(ac, env, init, sim, aero_model) -> dict:
 
     w_pitch = math.sqrt(k_th / I_pitch) if I_pitch > 0 else 0.0
     w_yaw = math.sqrt(k_ps / I_yaw) if I_yaw > 0 else 0.0
-    n_sub = int(min(200, max(1, math.ceil(sim.dt * max(w_pitch, w_yaw, 1e-9) / 1.5))))
+    scale_guard = 2.0 if aero_model is not None else 1.0  # UI 크기 배율 4x → ω roughly 2x
+    n_sub = int(min(300, max(1, math.ceil(sim.dt * max(w_pitch, w_yaw, 1e-9) * scale_guard / 1.5))))
 
     return {
         "mode": mode, "q": q, "dt": sim.dt, "n_sub": n_sub,
@@ -101,11 +102,8 @@ _TEMPLATE = r"""
     <button id="ac_pause" style="padding:6px 14px;border:0;border-radius:8px;background:#6b7785;color:#fff;font-weight:600;cursor:pointer;">&#9208; 일시정지</button>
     <button id="ac_stop"  style="padding:6px 14px;border:0;border-radius:8px;background:#d64545;color:#fff;font-weight:600;cursor:pointer;">&#9209; 정지</button>
     <label style="margin-left:8px;font-size:13px;">속도
-      <select id="ac_speed" style="padding:3px;border-radius:6px;">
-        <option value="0.25">0.25&times;</option><option value="0.5">0.5&times;</option>
-        <option value="1" selected>1&times;</option><option value="2">2&times;</option>
-        <option value="4">4&times;</option>
-      </select>
+      <input id="ac_speed" type="range" min="0.05" max="10" step="0.05" value="1" style="width:120px;vertical-align:middle;">
+      <input id="ac_speed_num" type="number" min="0.01" max="50" step="0.05" value="1" style="width:62px;padding:2px;border-radius:6px;border:1px solid #cbd5e1;">&times;
     </label>
     <label style="font-size:13px;"><input type="checkbox" id="ac_ghost" checked> 초기자세</label>
     <span id="ac_hint" style="margin-left:auto;font-size:12px;color:#6b7785;">정지 전까지 연속 시뮬레이션 · 드래그=회전 · 휠=확대</span>
@@ -168,7 +166,7 @@ _TEMPLATE = r"""
       baseFit = 3.0 / (Math.max(s.x,s.y,s.z) || 1);
       STL_GEOM = g;
       document.getElementById('ac_hint').textContent =
-        'STL 연속 시뮬레이션 · 기수가 파란 바람 화살표(+X)를 향하도록 회전 조절';
+        'STL 연속 시뮬레이션 · 속도 자유 조정 · 크기 조절은 ray 물리에도 즉시 반영';
     } catch(e){ errEl.textContent = 'STL 을 읽지 못했습니다: '+e.message; STL_GEOM=null; }
   }
 
@@ -216,8 +214,10 @@ _TEMPLATE = r"""
   const elScale=document.getElementById('ac_scale'), elScaleV=document.getElementById('ac_scaleval');
   const elRx=document.getElementById('ac_rx'), elRy=document.getElementById('ac_ry'), elRz=document.getElementById('ac_rz');
   const _fine=new THREE.Quaternion(), _qm=new THREE.Quaternion();
+  let physScale = 1.0;
   function applyModelTransform(){
-    const s=parseFloat(elScale.value)*baseFit;
+    physScale = parseFloat(elScale.value) || 1.0;
+    const s=physScale*baseFit;
     _fine.setFromEuler(new THREE.Euler(parseFloat(elRx.value)*D2R,parseFloat(elRy.value)*D2R,parseFloat(elRz.value)*D2R,'XYZ'));
     _qm.copy(qAlign).multiply(_fine);
     for(const m of [planeModel,ghostModel]){ m.scale.setScalar(s); m.quaternion.copy(_qm); }
@@ -274,13 +274,17 @@ _TEMPLATE = r"""
   function momentsAero(th,ph,ps){
     const w=windBody(th,ph,ps);
     const al=Math.atan2(w[1],-w[0]), be=Math.atan2(w[2],-w[0]);
-    const F=bilin(DYN.aero.Fg,al,be), Mo=bilin(DYN.aero.Mg,al,be), cg=DYN.aero.cg_point, q=DYN.q;
-    // M_cg = Mo - cg×F  (per q) → ×q
-    const Mx=(Mo[0]-(cg[1]*F[2]-cg[2]*F[1]))*q;
-    const My=(Mo[1]-(cg[2]*F[0]-cg[0]*F[2]))*q;
-    const Mz=(Mo[2]-(cg[0]*F[1]-cg[1]*F[0]))*q;
+    const Fb=bilin(DYN.aero.Fg,al,be), Mob=bilin(DYN.aero.Mg,al,be), cg0=DYN.aero.cg_point, q=DYN.q;
+    const ss=(DYN.mode==='aero'?physScale:1), s2=ss*ss, s3=s2*ss;
+    const F=[Fb[0]*q*s2,Fb[1]*q*s2,Fb[2]*q*s2];
+    const Mo=[Mob[0]*q*s3,Mob[1]*q*s3,Mob[2]*q*s3];
+    const cg=[cg0[0]*ss,cg0[1]*ss,cg0[2]*ss];
+    // F ∝ scale², origin moment and cg×F moment ∝ scale³
+    const Mx=Mo[0]-(cg[1]*F[2]-cg[2]*F[1]);
+    const My=Mo[1]-(cg[2]*F[0]-cg[0]*F[2]);
+    const Mz=Mo[2]-(cg[0]*F[1]-cg[1]*F[0]);
     // body_moments: roll=Mx, pitch=Mz, yaw=-My
-    return [Mz, Mx, -My, al*R2D, F[1]*q];
+    return [Mz, Mx, -My, al*R2D, F[1]];
   }
   function moments(th,ph,ps){ return DYN.mode==='aero'? momentsAero(th,ph,ps):momentsParam(th,ph,ps); }
 
@@ -295,9 +299,12 @@ _TEMPLATE = r"""
     const h=DYN.dt/DYN.n_sub;
     for(let s=0;s<DYN.n_sub;s++){
       const m=moments(st.th,st.ph,st.ps);
-      st.q=(st.q+(m[0]/DYN.Ipitch)*h)/(1+(DYN.cd_p/DYN.Ipitch)*h);
-      st.p=(st.p+(m[1]/DYN.Iroll)*h)/(1+(DYN.cd_r/DYN.Iroll)*h);
-      st.r=(st.r+(m[2]/DYN.Iyaw)*h)/(1+(DYN.cd_y/DYN.Iyaw)*h);
+      const ss=(DYN.mode==='aero'?physScale:1), si=ss*ss, sc=Math.pow(ss,2.5);
+      const Ip=DYN.Ipitch*si, Ir=DYN.Iroll*si, Iy=DYN.Iyaw*si;
+      const cdp=DYN.cd_p*sc, cdr=DYN.cd_r*sc, cdy=DYN.cd_y*sc;
+      st.q=(st.q+(m[0]/Ip)*h)/(1+(cdp/Ip)*h);
+      st.p=(st.p+(m[1]/Ir)*h)/(1+(cdr/Ir)*h);
+      st.r=(st.r+(m[2]/Iy)*h)/(1+(cdy/Iy)*h);
       st.th+=st.q*h; st.ph+=st.p*h; st.ps+=st.r*h;
       st.th=Math.max(-CLP,Math.min(CLP,st.th)); st.ph=wrap(st.ph); st.ps=wrap(st.ps);
       st.aoa=m[3]; st.lift=m[4];
@@ -307,6 +314,15 @@ _TEMPLATE = r"""
 
   // ===================== 재생 루프 =====================
   let playing=false, speed=1, lastTs=null, accum=0;
+  const speedRange=document.getElementById('ac_speed'), speedNum=document.getElementById('ac_speed_num');
+  function setSpeed(v){
+    speed=Math.max(0.01,Math.min(50,parseFloat(v)||1));
+    speedRange.value=Math.max(0.05,Math.min(10,speed));
+    speedNum.value=speed.toFixed(2).replace(/\.00$/,'');
+  }
+  speedRange.addEventListener('input',e=>setSpeed(e.target.value));
+  speedNum.addEventListener('change',e=>setSpeed(e.target.value));
+  setSpeed(1);
   function frame(ts){
     if(holder.clientWidth && holder.clientWidth!==W){ W=holder.clientWidth; renderer.setSize(W,H); camera.aspect=W/H; camera.updateProjectionMatrix(); }
     if(playing){
@@ -319,14 +335,14 @@ _TEMPLATE = r"""
     setAttitude(plane, st.th, st.ph, st.ps);
     hud.innerHTML = 't = '+st.T.toFixed(1)+' s'+(playing?' ▶':' ⏸')+'<br>pitch '+(st.th*R2D).toFixed(1)+
       '&deg; &nbsp; roll '+(st.ph*R2D).toFixed(1)+'&deg;<br>yaw '+(st.ps*R2D).toFixed(1)+
-      '&deg; &nbsp; AoA '+st.aoa.toFixed(1)+'&deg;';
+      '&deg; &nbsp; AoA '+st.aoa.toFixed(1)+'&deg;<br>속도 '+speed.toFixed(2)+
+      '&times;'+(DYN.mode==='aero'?' &nbsp; 크기 '+physScale.toFixed(2)+'&times;':'');
     renderer.render(scene,camera);
     requestAnimationFrame(frame);
   }
   document.getElementById('ac_play').onclick =function(){ playing=true; lastTs=null; };
   document.getElementById('ac_pause').onclick=function(){ playing=false; };
   document.getElementById('ac_stop').onclick =function(){ playing=false; st=initState(); };
-  document.getElementById('ac_speed').onchange=function(e){ speed=parseFloat(e.target.value); };
   document.getElementById('ac_ghost').onchange=function(e){ ghost.visible=e.target.checked; };
 
   requestAnimationFrame(frame);

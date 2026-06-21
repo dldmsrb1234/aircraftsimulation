@@ -103,7 +103,9 @@ def yaw_trend(res: SimResult) -> tuple[str, str]:
 # ---------------------------------------------------------------------------
 # 전체 안정성 + 제작 적합성 점수
 # ---------------------------------------------------------------------------
-def overall_assessment(ac: Aircraft, env: Environment, res: SimResult) -> dict:
+def overall_assessment(ac: Aircraft, env: Environment, res: SimResult,
+                       k_theta_override: float | None = None,
+                       k_psi_override: float | None = None) -> dict:
     """모든 판정을 모아 전체 안정성 라벨과 0~100 점수를 만든다."""
     aoa_label, aoa_lvl = aoa_status(float(np.max(np.abs(res.aoa))))
     cp_label, cp_lvl = cp_cg_relation(float(res.cp[0]), ac.cg, ac.length)
@@ -111,8 +113,10 @@ def overall_assessment(ac: Aircraft, env: Environment, res: SimResult) -> dict:
     r_label, r_lvl = roll_trend(res)
     y_label, y_lvl = yaw_trend(res)
 
-    k_theta = physics.pitch_stiffness(ac, env, 0.0)
-    k_psi = physics.yaw_stiffness(ac, env)
+    k_theta = (physics.pitch_stiffness(ac, env, 0.0)
+               if k_theta_override is None else float(k_theta_override))
+    k_psi = (physics.yaw_stiffness(ac, env)
+             if k_psi_override is None else float(k_psi_override))
 
     # ---- 점수 구성 (각 항목 가중합) ----
     score = 0.0

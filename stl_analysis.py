@@ -67,7 +67,7 @@ def align_matrix(fwd: str, up: str) -> np.ndarray:
     # up 에서 f 성분 제거(직교화) 후 정규화
     u = u - np.dot(u, f) * f
     if np.linalg.norm(u) < 1e-9:
-        u = np.array([0.0, 1.0, 0.0])
+        raise ValueError("기수(앞) 축과 위(상단) 축은 서로 다른 방향이어야 합니다.")
     u = u / np.linalg.norm(u)
     r = np.cross(f, u)
     return np.vstack([f, u, r])           # 행이 f,u,r → R·f=e1 등
@@ -251,7 +251,7 @@ if __name__ == "__main__":
           "(기대 4,1,2)")
     print("volume:", round(r["volume"],4), "(기대", Lx*Ly*Lz, ")")
     print("Ix:", round(r["Ix"],4), "기대", round(M/12*(Ly**2+Lz**2),4))
-    print("Iy:", round(r["Iy"],4), "기대", round(M/12*(Lx**2+Lz**2),4))
-    print("Iz:", round(r["Iz"],4), "기대", round(M/12*(Lx**2+Ly**2),4))
+    print("Iy:", round(r["Iy"],4), "기대", round(M/12*(Lx**2+Ly**2),4))
+    print("Iz:", round(r["Iz"],4), "기대", round(M/12*(Lx**2+Lz**2),4))
     print("planform S(top):", round(r["S_plan"],4), "(기대", Lx*Lz, ")")
     print("cg from nose:", round(r["cg"],4), "(기대", Lx/2, ")")
