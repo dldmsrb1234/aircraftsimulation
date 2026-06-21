@@ -96,6 +96,14 @@ def _side_parts(ac: Aircraft):
     L, h = ac.length, ac.height
     cg = ac.cg
     def X(p): return p - cg
+    def pitched_segment(cx, cz, chord, incidence_deg):
+        a = math.radians(incidence_deg)
+        dx = np.array([-chord / 2, chord / 2], dtype=float)
+        return list(cx + dx * math.cos(a)), list(cz - dx * math.sin(a))
+    def pitched_point(cx, cz, x_body, incidence_deg):
+        a = math.radians(incidence_deg)
+        dx = x_body - cx
+        return cx + dx * math.cos(a), cz - dx * math.sin(a)
     hh = max(h * 0.5, L * 0.04)         # 동체 반높이
 
     # 동체 외곽(폐곡선)
@@ -104,13 +112,16 @@ def _side_parts(ac: Aircraft):
     fus_x = [X(v) for v in fus_x]
 
     cw = 0.16 * L                       # 주날개 시위
-    wx = [X(ac.wing.position - cw / 2), X(ac.wing.position + cw / 2)]
-    wz = [-hh * 0.2, -hh * 0.2]
+    wing_cx = X(ac.wing.position)
+    wing_z = -hh * 0.2
+    wx, wz = pitched_segment(wing_cx, wing_z, cw, ac.wing.aoa_deg)
 
     xt = ac.cg + ac.htail.arm           # 수평꼬리 위치(절대)
     ct = 0.08 * L
-    tx = [X(xt - ct / 2), X(xt + ct / 2)]
-    tz = [ac.htail.height + hh * 0.1, ac.htail.height + hh * 0.1]
+    tail_cx = X(xt)
+    tail_z = ac.htail.height + hh * 0.1
+    tx, tz = pitched_segment(tail_cx, tail_z, ct, ac.htail.aoa_deg)
+    cp_x, cp_z = pitched_point(wing_cx, wing_z, X(ac.wing.cp_base), ac.wing.aoa_deg)
 
     # 수직꼬리(측면에서는 삼각형)
     vt_x = [X(xt - ct), X(xt + ct * 0.5), X(xt + ct * 0.5)]
@@ -122,8 +133,8 @@ def _side_parts(ac: Aircraft):
         "htail": (tx, tz),
         "vtail": (vt_x, vt_z),
         "cg": (0.0, 0.0),
-        "cp": (X(ac.wing.cp_base), -hh * 0.2),
-        "tail_pt": (X(xt), 0.0),
+        "cp": (cp_x, cp_z),
+        "tail_pt": (tail_cx, tail_z),
     }
 
 
@@ -322,6 +333,17 @@ def _aircraft_3d_parts(ac: Aircraft):
     """3D 부품을 (verts Nx3, tris list) 또는 라인으로 반환."""
     L, b, h, cg = ac.length, ac.span, ac.height, ac.cg
     def X(p): return p - cg
+    def incidence_panel(cx, cz, chord, span, incidence_deg):
+        a = math.radians(incidence_deg)
+        c, s = math.cos(a), math.sin(a)
+        x0, x1 = -chord / 2, chord / 2
+        y0, y1 = -span / 2, span / 2
+        return np.array([
+            [cx + x0 * c, y0, cz - x0 * s],
+            [cx + x1 * c, y0, cz - x1 * s],
+            [cx + x1 * c, y1, cz - x1 * s],
+            [cx + x0 * c, y1, cz - x0 * s],
+        ])
     parts = {}
 
     # 동체 라인
@@ -329,16 +351,12 @@ def _aircraft_3d_parts(ac: Aircraft):
 
     # 주날개 사각판
     xw = X(ac.wing.position); cw = 0.14 * L
-    parts["wing"] = (np.array([
-        [xw - cw / 2, -b / 2, 0], [xw + cw / 2, -b / 2, 0],
-        [xw + cw / 2, b / 2, 0], [xw - cw / 2, b / 2, 0]]),
+    parts["wing"] = (incidence_panel(xw, 0.0, cw, b, ac.wing.aoa_deg),
         [(0, 1, 2), (0, 2, 3)])
 
     # 수평꼬리
     xt = X(ac.cg + ac.htail.arm); ct = 0.06 * L; bt = 0.35 * b
-    parts["htail"] = (np.array([
-        [xt - ct / 2, -bt / 2, ac.htail.height], [xt + ct / 2, -bt / 2, ac.htail.height],
-        [xt + ct / 2, bt / 2, ac.htail.height], [xt - ct / 2, bt / 2, ac.htail.height]]),
+    parts["htail"] = (incidence_panel(xt, ac.htail.height, ct, bt, ac.htail.aoa_deg),
         [(0, 1, 2), (0, 2, 3)])
 
     # 수직꼬리(개수)

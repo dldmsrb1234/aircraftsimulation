@@ -180,8 +180,8 @@ _TEMPLATE = r"""
     const fus=new THREE.Mesh(new THREE.CylinderGeometry(0.17,0.15,2.4,20),mb); fus.rotation.z=Math.PI/2; root.add(fus);
     const nose=new THREE.Mesh(new THREE.ConeGeometry(0.17,0.5,20),mb); nose.rotation.z=-Math.PI/2; nose.position.x=1.45; root.add(nose);
     const tail=new THREE.Mesh(new THREE.ConeGeometry(0.15,0.4,20),mb); tail.rotation.z=Math.PI/2; tail.position.x=-1.4; root.add(tail);
-    const wing=new THREE.Mesh(new THREE.BoxGeometry(0.55,0.04,3.0),mw); wing.position.set(0.05,0,0); root.add(wing);
-    const ht=new THREE.Mesh(new THREE.BoxGeometry(0.38,0.035,1.15),mw); ht.position.set(-1.25,0.02,0); root.add(ht);
+    const wing=new THREE.Mesh(new THREE.BoxGeometry(0.55,0.04,3.0),mw); wing.position.set(0.05,0,0); wing.rotation.z=(DATA.wing_aoa||0)*D2R; root.add(wing);
+    const ht=new THREE.Mesh(new THREE.BoxGeometry(0.38,0.035,1.15),mw); ht.position.set(-1.25,0.02,0); ht.rotation.z=(DATA.htail_aoa||0)*D2R; root.add(ht);
     function fin(z,c){ const f=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.6,0.04),ma); f.position.set(-1.2,0.32,z); f.rotation.x=c; root.add(f); }
     if((DATA.vtail||1)>=2){fin(-0.45,0.20);fin(0.45,-0.20);} else {fin(0,0);}
     for(const z of [-0.95,0.95]){ const e=new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,0.5,14),ma); e.rotation.z=Math.PI/2; e.position.set(0.18,-0.16,z); root.add(e); }
