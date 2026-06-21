@@ -4,40 +4,91 @@ animation.py
 ============
 브라우저에서 도는 **실시간 3D 비행 애니메이션** 컴포넌트 (Three.js).
 
-- 서버(Streamlit) 재실행 없이 클라이언트(WebGL)에서 60fps 로 렌더 → 부드럽고 랙 없음
-- 마우스 드래그=시점 회전, 휠=확대
-- 지면 그리드 위에서 pitch·roll·yaw 가 실제 3D 자세로 움직임
-- 초기 자세는 반투명(고스트), 현재 자세는 진하게 표시
-- 재생/일시정지/정지/속도/반복 컨트롤은 모두 JS 안에서 동작
-- **사용자가 STL 모델을 업로드하면 그 모델을 비행기로 사용**하고,
-  업로드 후 **크기·정렬(회전)을 컴포넌트 안에서 실시간 조절** 가능
+- 물리(회전 동역학)를 **브라우저에서 실시간으로 계속 적분**한다.
+  → 시간 제한(t_end) 없이 **정지 버튼을 누를 때까지 계속** 시뮬레이션.
+- 파이썬 시뮬레이션과 **동일한 모델·반암시적 적분식**을 JS 로 이식 → 그래프와 일치.
+- aero_model 이 있으면 STL 표면 패널 공력 표를, 없으면 매개변수 모델을 사용.
+- 마우스 드래그=시점 회전, 휠=확대. STL 업로드 시 모델·크기·정렬 조절.
 """
 
 from __future__ import annotations
 import json
-from simulation import SimResult
+import math
+import numpy as np
+
 import stl_analysis
 
 
-def realtime_animation_html(res: SimResult, vtail_count: int = 1,
+# ---------------------------------------------------------------------------
+# 동역학 파라미터(파이썬 run_simulation 과 동일하게) → JS 로 전달
+# ---------------------------------------------------------------------------
+def _build_dyn(ac, env, init, sim, aero_model) -> dict:
+    q = 0.5 * env.rho * env.V * env.V
+    I_pitch, I_roll, I_yaw = ac.Iy, ac.Ix, ac.Iz
+    mult = sim.damping_mult
+
+    if aero_model is not None:
+        import panel_aero
+        cgp = panel_aero.cg_point_from_nose(aero_model, ac.cg)
+        k_th = abs(panel_aero.pitch_stiffness(aero_model, q, cgp))
+        k_ps = abs(panel_aero.yaw_stiffness(aero_model, q, cgp))
+        zeta = 0.4
+        cd_p = 2 * zeta * math.sqrt(max(k_th, 1e-12) * I_pitch) * mult
+        cd_y = 2 * zeta * math.sqrt(max(k_ps, 1e-12) * I_yaw) * mult
+        cd_r = I_roll * 3.0 * mult
+        aero = {
+            "alphas": [float(a) for a in aero_model["alphas"]],
+            "betas": [float(b) for b in aero_model["betas"]],
+            "Fg": [float(x) for x in np.asarray(aero_model["Fg"]).ravel()],
+            "Mg": [float(x) for x in np.asarray(aero_model["Mg"]).ravel()],
+            "cg_point": [float(c) for c in cgp],
+        }
+        param, mode = None, "aero"
+    else:
+        import physics
+        cd_p, cd_r, cd_y = ac.cd_pitch * mult, ac.cd_roll * mult, ac.cd_yaw * mult
+        k_th = abs(physics.pitch_stiffness(ac, env, 0.0))
+        k_ps = abs(physics.yaw_stiffness(ac, env))
+        aero = None
+        param = {
+            "wing_aoa": ac.wing.aoa_deg, "cl_alpha": ac.wing.cl_alpha,
+            "alpha_stall": ac.wing.alpha_stall_deg, "cl_max": ac.wing.cl_max,
+            "S_wing": ac.wing.area, "cp_base": ac.wing.cp_base,
+            "cp_auto": bool(ac.wing.cp_auto), "k_cp": ac.wing.k_cp, "cg": ac.cg,
+            "htail_aoa": ac.htail.aoa_deg, "htail_cl_alpha": ac.htail.cl_alpha,
+            "S_htail": ac.htail.area, "htail_arm": ac.htail.arm, "span": ac.wing.span,
+            "asymmetry": ac.asymmetry, "S_vtail": ac.vtail.area,
+            "vtail_count": ac.vtail.count, "vtail_cl_alpha": ac.vtail.cl_alpha,
+            "vtail_arm": ac.vtail.arm,
+        }
+        mode = "param"
+
+    w_pitch = math.sqrt(k_th / I_pitch) if I_pitch > 0 else 0.0
+    w_yaw = math.sqrt(k_ps / I_yaw) if I_yaw > 0 else 0.0
+    n_sub = int(min(200, max(1, math.ceil(sim.dt * max(w_pitch, w_yaw, 1e-9) / 1.5))))
+
+    return {
+        "mode": mode, "q": q, "dt": sim.dt, "n_sub": n_sub,
+        "Ipitch": I_pitch, "Iroll": I_roll, "Iyaw": I_yaw,
+        "cd_p": cd_p, "cd_r": cd_r, "cd_y": cd_y,
+        "pitch0": init.pitch0_deg, "roll0": init.roll0_deg, "yaw0": init.yaw0_deg,
+        "p0": init.p0_deg, "q0": init.q0_deg, "r0": init.r0_deg,
+        "aero": aero, "param": param,
+    }
+
+
+def realtime_animation_html(ac, env, init, sim, aero_model=None,
                             stl_b64: str = "",
                             align_fwd: str = "+X", align_up: str = "+Y") -> str:
-    """pitch/roll/yaw 시계열(+선택적 STL)을 JS 로 넘겨 3D 애니메이션 HTML 생성."""
-    t = res.t
-    n = len(t)
-    step = max(1, n // 1500)
-    def arr(a):
-        return [round(float(v), 3) for v in a[::step]]
-    align = stl_analysis.align_matrix(align_fwd, align_up).tolist()  # 모델→표준 회전
+    """실시간 연속 3D 비행 애니메이션 HTML 생성."""
     data = {
-        "pitch": arr(res.pitch), "roll": arr(res.roll), "yaw": arr(res.yaw),
-        "aoa": arr(res.aoa), "t": arr(t),
-        "pitch0": float(res.pitch0), "roll0": float(res.roll0), "yaw0": float(res.yaw0),
-        "dt": float(t[1] - t[0]) * step,
-        "vtail": int(vtail_count),
-        "align": align,
+        "vtail": int(ac.vtail.count),
+        "align": stl_analysis.align_matrix(align_fwd, align_up).tolist(),
+        "pitch0": float(init.pitch0_deg),
+        "roll0": float(init.roll0_deg),
+        "yaw0": float(init.yaw0_deg),
+        "dyn": _build_dyn(ac, env, init, sim, aero_model),
     }
-    # STL 은 데이터가 클 수 있어 본문과 분리해 치환
     return (_TEMPLATE
             .replace("__DATA__", json.dumps(data))
             .replace("__STL_B64__", json.dumps(stl_b64 or "")))
@@ -56,9 +107,8 @@ _TEMPLATE = r"""
         <option value="4">4&times;</option>
       </select>
     </label>
-    <label style="font-size:13px;"><input type="checkbox" id="ac_loop" checked> 반복</label>
     <label style="font-size:13px;"><input type="checkbox" id="ac_ghost" checked> 초기자세</label>
-    <span id="ac_hint" style="margin-left:auto;font-size:12px;color:#6b7785;">드래그=회전 · 휠=확대</span>
+    <span id="ac_hint" style="margin-left:auto;font-size:12px;color:#6b7785;">정지 전까지 연속 시뮬레이션 · 드래그=회전 · 휠=확대</span>
   </div>
   <div id="ac_modelbar" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 8px;padding:6px 8px;background:#eef3f9;border-radius:8px;font-size:12px;">
     <b>모델 조절</b>
@@ -72,7 +122,6 @@ _TEMPLATE = r"""
     <div id="ac_hud" style="position:absolute;left:10px;top:8px;font-size:13px;font-weight:600;color:#15314f;background:rgba(255,255,255,0.65);padding:4px 8px;border-radius:6px;font-variant-numeric:tabular-nums;"></div>
     <div id="ac_err" style="position:absolute;left:10px;bottom:8px;font-size:12px;color:#b00;"></div>
   </div>
-  <input id="ac_scrub" type="range" min="0" value="0" step="1" style="width:100%;margin-top:6px;">
 </div>
 <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
 <script src="https://unpkg.com/three@0.128.0/examples/js/loaders/STLLoader.js"></script>
@@ -80,13 +129,11 @@ _TEMPLATE = r"""
 (function(){
   const DATA = __DATA__;
   const STL_B64 = __STL_B64__;
-  const N = DATA.t.length;
-  const D2R = Math.PI/180;
+  const DYN = DATA.dyn;
+  const D2R = Math.PI/180, R2D = 180/Math.PI;
   const holder = document.getElementById('ac_holder');
   const hud = document.getElementById('ac_hud');
   const errEl = document.getElementById('ac_err');
-  const scrub = document.getElementById('ac_scrub');
-  scrub.max = N-1;
 
   if (typeof THREE === 'undefined') {
     errEl.textContent = '3D 라이브러리를 불러오지 못했습니다(인터넷 연결 확인).';
@@ -103,185 +150,185 @@ _TEMPLATE = r"""
 
   const camera = new THREE.PerspectiveCamera(42, W/H, 0.1, 500);
   scene.add(new THREE.HemisphereLight(0xffffff, 0x6b7a90, 0.95));
-  const dir = new THREE.DirectionalLight(0xffffff, 0.75);
-  dir.position.set(5, 10, 7); scene.add(dir);
-  const dir2 = new THREE.DirectionalLight(0xffffff, 0.3);
-  dir2.position.set(-6, 4, -5); scene.add(dir2);
+  const dir = new THREE.DirectionalLight(0xffffff, 0.75); dir.position.set(5,10,7); scene.add(dir);
+  const dir2 = new THREE.DirectionalLight(0xffffff, 0.3); dir2.position.set(-6,4,-5); scene.add(dir2);
+  const grid = new THREE.GridHelper(24, 24, 0x9fb3c8, 0xc7d4e2); grid.position.y = -1.4; scene.add(grid);
+  for (let k=-1;k<=1;k++)
+    scene.add(new THREE.ArrowHelper(new THREE.Vector3(-1,0,0), new THREE.Vector3(3.6,0,k*0.7), 1.6, 0x57b0ff, 0.35, 0.22));
 
-  const grid = new THREE.GridHelper(24, 24, 0x9fb3c8, 0xc7d4e2);
-  grid.position.y = -1.4; scene.add(grid);
-
-  // 정면에서 불어오는 바람(공기 흐름) 화살표 (+X 쪽에서 -X 로)
-  for (let k=-1;k<=1;k++){
-    scene.add(new THREE.ArrowHelper(new THREE.Vector3(-1,0,0),
-        new THREE.Vector3(3.6, 0.0, k*0.7), 1.6, 0x57b0ff, 0.35, 0.22));
-  }
-
-  // --- STL 파싱(있으면) ---
+  // --- STL 파싱 ---
   let STL_GEOM = null, baseFit = 1.0;
   if (STL_B64) {
     try {
-      const bin = atob(STL_B64);
-      const bytes = new Uint8Array(bin.length);
-      for (let i=0;i<bin.length;i++) bytes[i] = bin.charCodeAt(i);
-      const geom = new THREE.STLLoader().parse(bytes.buffer);
-      geom.center();
-      geom.computeVertexNormals();
-      geom.computeBoundingBox();
-      const size = new THREE.Vector3(); geom.boundingBox.getSize(size);
-      const maxDim = Math.max(size.x, size.y, size.z) || 1;
-      baseFit = 3.0 / maxDim;                 // 최대 치수를 약 3 단위로 정규화
-      STL_GEOM = geom;
+      const bin = atob(STL_B64), bytes = new Uint8Array(bin.length);
+      for (let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+      const g = new THREE.STLLoader().parse(bytes.buffer);
+      g.center(); g.computeVertexNormals(); g.computeBoundingBox();
+      const s = new THREE.Vector3(); g.boundingBox.getSize(s);
+      baseFit = 3.0 / (Math.max(s.x,s.y,s.z) || 1);
+      STL_GEOM = g;
       document.getElementById('ac_hint').textContent =
-        'STL 사용 중 · 기수가 파란 바람 화살표 쪽(+X)을 향하도록 회전 조절';
-    } catch (e) {
-      errEl.textContent = 'STL 을 읽지 못했습니다(' + e.message + '). 기본 모델을 사용합니다.';
-      STL_GEOM = null;
-    }
+        'STL 연속 시뮬레이션 · 기수가 파란 바람 화살표(+X)를 향하도록 회전 조절';
+    } catch(e){ errEl.textContent = 'STL 을 읽지 못했습니다: '+e.message; STL_GEOM=null; }
   }
 
-  // --- 기본(내장) 항공기 모델 ---
-  function buildPrimitive(root, opts){
-    const matBody = new THREE.MeshStandardMaterial({color:opts.body, metalness:0.2, roughness:0.6, transparent:opts.alpha<1, opacity:opts.alpha});
-    const matWing = new THREE.MeshStandardMaterial({color:opts.wing, metalness:0.2, roughness:0.6, transparent:opts.alpha<1, opacity:opts.alpha});
-    const matAcc  = new THREE.MeshStandardMaterial({color:opts.acc,  metalness:0.2, roughness:0.6, transparent:opts.alpha<1, opacity:opts.alpha});
-    const fus = new THREE.Mesh(new THREE.CylinderGeometry(0.17,0.15,2.4,20), matBody);
-    fus.rotation.z = Math.PI/2; root.add(fus);
-    const nose = new THREE.Mesh(new THREE.ConeGeometry(0.17,0.5,20), matBody);
-    nose.rotation.z = -Math.PI/2; nose.position.x = 1.45; root.add(nose);
-    const tail = new THREE.Mesh(new THREE.ConeGeometry(0.15,0.4,20), matBody);
-    tail.rotation.z = Math.PI/2; tail.position.x = -1.4; root.add(tail);
-    const wing = new THREE.Mesh(new THREE.BoxGeometry(0.55,0.04,3.0), matWing);
-    wing.position.set(0.05,0,0); root.add(wing);
-    const htail = new THREE.Mesh(new THREE.BoxGeometry(0.38,0.035,1.15), matWing);
-    htail.position.set(-1.25,0.02,0); root.add(htail);
-    function fin(zoff, cant){
-      const f = new THREE.Mesh(new THREE.BoxGeometry(0.5,0.6,0.04), matAcc);
-      f.position.set(-1.2, 0.32, zoff); f.rotation.x = cant; root.add(f);
-    }
-    if ((DATA.vtail||1) >= 2){ fin(-0.45, 0.20); fin(0.45,-0.20); } else { fin(0,0); }
-    for (const z of [-0.95, 0.95]){
-      const e = new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,0.5,14), matAcc);
-      e.rotation.z = Math.PI/2; e.position.set(0.18,-0.16,z); root.add(e);
-    }
+  function buildPrimitive(root, o){
+    const mb=new THREE.MeshStandardMaterial({color:o.body,metalness:0.2,roughness:0.6,transparent:o.alpha<1,opacity:o.alpha});
+    const mw=new THREE.MeshStandardMaterial({color:o.wing,metalness:0.2,roughness:0.6,transparent:o.alpha<1,opacity:o.alpha});
+    const ma=new THREE.MeshStandardMaterial({color:o.acc,metalness:0.2,roughness:0.6,transparent:o.alpha<1,opacity:o.alpha});
+    const fus=new THREE.Mesh(new THREE.CylinderGeometry(0.17,0.15,2.4,20),mb); fus.rotation.z=Math.PI/2; root.add(fus);
+    const nose=new THREE.Mesh(new THREE.ConeGeometry(0.17,0.5,20),mb); nose.rotation.z=-Math.PI/2; nose.position.x=1.45; root.add(nose);
+    const tail=new THREE.Mesh(new THREE.ConeGeometry(0.15,0.4,20),mb); tail.rotation.z=Math.PI/2; tail.position.x=-1.4; root.add(tail);
+    const wing=new THREE.Mesh(new THREE.BoxGeometry(0.55,0.04,3.0),mw); wing.position.set(0.05,0,0); root.add(wing);
+    const ht=new THREE.Mesh(new THREE.BoxGeometry(0.38,0.035,1.15),mw); ht.position.set(-1.25,0.02,0); root.add(ht);
+    function fin(z,c){ const f=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.6,0.04),ma); f.position.set(-1.2,0.32,z); f.rotation.x=c; root.add(f); }
+    if((DATA.vtail||1)>=2){fin(-0.45,0.20);fin(0.45,-0.20);} else {fin(0,0);}
+    for(const z of [-0.95,0.95]){ const e=new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,0.5,14),ma); e.rotation.z=Math.PI/2; e.position.set(0.18,-0.16,z); root.add(e); }
   }
-
-  // 모델 루트(정렬 회전 + 크기) 생성
   function makeModel(alpha){
-    const root = new THREE.Group();
-    if (STL_GEOM){
-      const col = alpha < 1 ? 0xb9c4d2 : 0x3b82c4;
-      const mat = new THREE.MeshStandardMaterial({color:col, metalness:0.25, roughness:0.55,
-          transparent:alpha<1, opacity:alpha});
-      root.add(new THREE.Mesh(STL_GEOM, mat));
+    const root=new THREE.Group();
+    if(STL_GEOM){
+      const col=alpha<1?0xb9c4d2:0x3b82c4;
+      root.add(new THREE.Mesh(STL_GEOM, new THREE.MeshStandardMaterial({color:col,metalness:0.25,roughness:0.55,transparent:alpha<1,opacity:alpha})));
     } else {
-      const opts = alpha < 1
-        ? {body:0xb9c4d2, wing:0x9fb6d4, acc:0x9fb6d4, alpha:alpha}
-        : {body:0xf2f5f9, wing:0x1f7ae0, acc:0x0d3b66, alpha:alpha};
-      buildPrimitive(root, opts);
+      buildPrimitive(root, alpha<1?{body:0xb9c4d2,wing:0x9fb6d4,acc:0x9fb6d4,alpha:alpha}:{body:0xf2f5f9,wing:0x1f7ae0,acc:0x0d3b66,alpha:alpha});
     }
     return root;
   }
 
-  // 외곽 그룹(비행 자세) + 내부 모델 루트(정렬/크기)
-  const plane = new THREE.Group();
-  const planeModel = makeModel(1.0); plane.add(planeModel); scene.add(plane);
-  const ghost = new THREE.Group();
-  const ghostModel = makeModel(0.22); ghost.add(ghostModel); scene.add(ghost);
+  const plane=new THREE.Group(); const planeModel=makeModel(1.0); plane.add(planeModel); scene.add(plane);
+  const ghost=new THREE.Group(); const ghostModel=makeModel(0.22); ghost.add(ghostModel); scene.add(ghost);
 
-  // 자세 → 쿼터니언 (yaw:Y, pitch:Z, roll:X)
+  // 자세 쿼터니언 (yaw:Y, pitch:Z, roll:X)
   const AX_Y=new THREE.Vector3(0,1,0), AX_Z=new THREE.Vector3(0,0,1), AX_X=new THREE.Vector3(1,0,0);
   const _qy=new THREE.Quaternion(), _qp=new THREE.Quaternion(), _qr=new THREE.Quaternion();
-  function setAttitude(obj, pDeg, rDeg, yDeg){
-    _qy.setFromAxisAngle(AX_Y, -yDeg*D2R);
-    _qp.setFromAxisAngle(AX_Z,  pDeg*D2R);
-    _qr.setFromAxisAngle(AX_X,  rDeg*D2R);
-    obj.quaternion.copy(_qy).multiply(_qp).multiply(_qr);
+  function attitudeQuat(pRad,rRad,yRad){
+    _qy.setFromAxisAngle(AX_Y,-yRad); _qp.setFromAxisAngle(AX_Z,pRad); _qr.setFromAxisAngle(AX_X,rRad);
+    return new THREE.Quaternion().copy(_qy).multiply(_qp).multiply(_qr);
   }
-  setAttitude(ghost, DATA.pitch0, DATA.roll0, DATA.yaw0);
+  function setAttitude(obj,pRad,rRad,yRad){ obj.quaternion.copy(attitudeQuat(pRad,rRad,yRad)); }
+  setAttitude(ghost, DATA.pitch0*D2R, DATA.roll0*D2R, DATA.yaw0*D2R);
 
-  // 축 정렬 쿼터니언(모델→표준) — 사이드바 축 선택과 동일
-  const A = DATA.align;
-  const mAlign = new THREE.Matrix4();
-  mAlign.set(A[0][0],A[0][1],A[0][2],0, A[1][0],A[1][1],A[1][2],0,
-             A[2][0],A[2][1],A[2][2],0, 0,0,0,1);
-  const qAlign = new THREE.Quaternion().setFromRotationMatrix(mAlign);
-
-  // --- 모델 크기/미세정렬 컨트롤 ---
+  // 정렬(모델→표준) + 모델 크기/미세회전
+  const A=DATA.align, mAlign=new THREE.Matrix4();
+  mAlign.set(A[0][0],A[0][1],A[0][2],0, A[1][0],A[1][1],A[1][2],0, A[2][0],A[2][1],A[2][2],0, 0,0,0,1);
+  const qAlign=new THREE.Quaternion().setFromRotationMatrix(mAlign);
   const elScale=document.getElementById('ac_scale'), elScaleV=document.getElementById('ac_scaleval');
   const elRx=document.getElementById('ac_rx'), elRy=document.getElementById('ac_ry'), elRz=document.getElementById('ac_rz');
   const _fine=new THREE.Quaternion(), _qm=new THREE.Quaternion();
   function applyModelTransform(){
-    const s = parseFloat(elScale.value) * baseFit;
-    _fine.setFromEuler(new THREE.Euler(parseFloat(elRx.value)*D2R,
-        parseFloat(elRy.value)*D2R, parseFloat(elRz.value)*D2R, 'XYZ'));
+    const s=parseFloat(elScale.value)*baseFit;
+    _fine.setFromEuler(new THREE.Euler(parseFloat(elRx.value)*D2R,parseFloat(elRy.value)*D2R,parseFloat(elRz.value)*D2R,'XYZ'));
     _qm.copy(qAlign).multiply(_fine);
-    for (const m of [planeModel, ghostModel]){ m.scale.setScalar(s); m.quaternion.copy(_qm); }
-    elScaleV.innerHTML = parseFloat(elScale.value).toFixed(2)+'&times;';
+    for(const m of [planeModel,ghostModel]){ m.scale.setScalar(s); m.quaternion.copy(_qm); }
+    elScaleV.innerHTML=parseFloat(elScale.value).toFixed(2)+'&times;';
   }
-  [elScale, elRx, elRy, elRz].forEach(el => el.addEventListener('input', applyModelTransform));
-  document.getElementById('ac_reset').onclick = function(){ elScale.value=1; elRx.value=0; elRy.value=0; elRz.value=0; applyModelTransform(); };
+  [elScale,elRx,elRy,elRz].forEach(el=>el.addEventListener('input',applyModelTransform));
+  document.getElementById('ac_reset').onclick=function(){ elScale.value=1; elRx.value=0; elRy.value=0; elRz.value=0; applyModelTransform(); };
   applyModelTransform();
 
-  // --- 궤도 카메라 ---
-  const target = new THREE.Vector3(0,0,0);
-  let az = -0.7, el = 0.32, radius = 6.2;
-  function updateCam(){
-    camera.position.set(
-      target.x + radius*Math.cos(el)*Math.cos(az),
-      target.y + radius*Math.sin(el),
-      target.z + radius*Math.cos(el)*Math.sin(az));
-    camera.lookAt(target);
-  }
-  let dragging=false, px=0, py=0;
-  renderer.domElement.addEventListener('mousedown', e=>{dragging=true;px=e.clientX;py=e.clientY;});
-  window.addEventListener('mouseup', ()=>{dragging=false;});
-  window.addEventListener('mousemove', e=>{
-    if(!dragging)return;
-    az -= (e.clientX-px)*0.01; el += (e.clientY-py)*0.01;
-    el = Math.max(-1.3, Math.min(1.3, el)); px=e.clientX; py=e.clientY; updateCam();
-  });
-  renderer.domElement.addEventListener('wheel', e=>{
-    e.preventDefault(); radius *= (1 + Math.sign(e.deltaY)*0.08);
-    radius = Math.max(3, Math.min(20, radius)); updateCam();
-  }, {passive:false});
+  // 궤도 카메라
+  const target=new THREE.Vector3(0,0,0); let az=-0.7, el=0.32, radius=6.2;
+  function updateCam(){ camera.position.set(target.x+radius*Math.cos(el)*Math.cos(az), target.y+radius*Math.sin(el), target.z+radius*Math.cos(el)*Math.sin(az)); camera.lookAt(target); }
+  let drag=false,px=0,py=0;
+  renderer.domElement.addEventListener('mousedown',e=>{drag=true;px=e.clientX;py=e.clientY;});
+  window.addEventListener('mouseup',()=>{drag=false;});
+  window.addEventListener('mousemove',e=>{ if(!drag)return; az-=(e.clientX-px)*0.01; el+=(e.clientY-py)*0.01; el=Math.max(-1.3,Math.min(1.3,el)); px=e.clientX; py=e.clientY; updateCam(); });
+  renderer.domElement.addEventListener('wheel',e=>{ e.preventDefault(); radius*=(1+Math.sign(e.deltaY)*0.08); radius=Math.max(3,Math.min(20,radius)); updateCam(); }, {passive:false});
   updateCam();
 
-  // --- 렌더 / 재생 ---
-  function show(i){
-    if(i<0)i=0; if(i>N-1)i=N-1;
-    const p=DATA.pitch[i], r=DATA.roll[i], y=DATA.yaw[i];
-    setAttitude(plane, p, r, y);
-    hud.innerHTML = 't = '+DATA.t[i].toFixed(2)+' s<br>pitch '+p.toFixed(1)+
-      '&deg; &nbsp; roll '+r.toFixed(1)+'&deg;<br>yaw '+y.toFixed(1)+
-      '&deg; &nbsp; AoA '+DATA.aoa[i].toFixed(1)+'&deg;';
+  // ===================== 실시간 연속 동역학 =====================
+  function clBody(alpha, p){
+    const sgn=alpha>=0?1:-1, a=Math.abs(alpha), ast=p.alpha_stall*D2R, lin=p.cl_alpha*a;
+    let peak=p.cl_alpha*ast; if(p.cl_max>0 && p.cl_max<peak) peak=p.cl_max;
+    if(a<=ast) return sgn*lin;
+    let post=peak-0.7*p.cl_alpha*(a-ast); post=Math.max(post,0.35*peak); return sgn*post;
   }
-  let idxF=0, playing=false, last=null, speed=1, loop=true;
-  function setIdx(i){idxF=i;scrub.value=Math.round(i);show(Math.round(i));}
+  function momentsParam(th,ph,ps){
+    const p=DYN.param, q=DYN.q;
+    const aw=p.wing_aoa*D2R+th, clw=clBody(aw,p), Lw=q*p.S_wing*clw;
+    const xcp=p.cp_base+(p.cp_auto? p.k_cp*aw:0);
+    const at=p.htail_aoa*D2R+th, Lt=q*p.S_htail*p.htail_cl_alpha*at;
+    const Mp=Lw*(p.cg-xcp)-Lt*p.htail_arm;
+    const Lwb=q*p.S_wing*clBody(p.wing_aoa*D2R,p);
+    const Mr=p.asymmetry*Lwb*(p.span/4);
+    const My=-(q*p.S_vtail*p.vtail_count*p.vtail_cl_alpha*ps)*p.vtail_arm + p.asymmetry*0.05*q*p.S_wing*p.span;
+    return [Mp,Mr,My, aw*R2D, Lw];
+  }
+  function windBody(th,ph,ps){
+    const qf=attitudeQuat(th,ph,ps).invert();
+    const w=new THREE.Vector3(-1,0,0).applyQuaternion(qf);
+    return [w.x,w.y,w.z];
+  }
+  function bilin(arr, al, be){
+    const A=DYN.aero.alphas, B=DYN.aero.betas, na=A.length, nb=B.length;
+    let a=Math.min(Math.max(al,A[0]),A[na-1]), b=Math.min(Math.max(be,B[0]),B[nb-1]);
+    let ia=0; while(ia<na-2 && A[ia+1]<a) ia++;
+    let ib=0; while(ib<nb-2 && B[ib+1]<b) ib++;
+    const ta=(a-A[ia])/(A[ia+1]-A[ia]), tb=(b-B[ib])/(B[ib+1]-B[ib]);
+    const g=(i,j,k)=>arr[((i*nb+j)*3)+k];
+    const out=[0,0,0];
+    for(let k=0;k<3;k++) out[k]=g(ia,ib,k)*(1-ta)*(1-tb)+g(ia+1,ib,k)*ta*(1-tb)+g(ia,ib+1,k)*(1-ta)*tb+g(ia+1,ib+1,k)*ta*tb;
+    return out;
+  }
+  function momentsAero(th,ph,ps){
+    const w=windBody(th,ph,ps);
+    const al=Math.atan2(w[1],-w[0]), be=Math.atan2(w[2],-w[0]);
+    const F=bilin(DYN.aero.Fg,al,be), Mo=bilin(DYN.aero.Mg,al,be), cg=DYN.aero.cg_point, q=DYN.q;
+    // M_cg = Mo - cg×F  (per q) → ×q
+    const Mx=(Mo[0]-(cg[1]*F[2]-cg[2]*F[1]))*q;
+    const My=(Mo[1]-(cg[2]*F[0]-cg[0]*F[2]))*q;
+    const Mz=(Mo[2]-(cg[0]*F[1]-cg[1]*F[0]))*q;
+    // body_moments: roll=Mx, pitch=Mz, yaw=-My
+    return [Mz, Mx, -My, al*R2D, F[1]*q];
+  }
+  function moments(th,ph,ps){ return DYN.mode==='aero'? momentsAero(th,ph,ps):momentsParam(th,ph,ps); }
+
+  const CLP=89*D2R;
+  function wrap(a){ while(a>Math.PI)a-=2*Math.PI; while(a<-Math.PI)a+=2*Math.PI; return a; }
+  let st = initState();
+  function initState(){
+    return {th:DATA.pitch0*D2R, ph:DATA.roll0*D2R, ps:DATA.yaw0*D2R,
+            q:DYN.q0*D2R, p:DYN.p0*D2R, r:DYN.r0*D2R, T:0, aoa:0, lift:0};
+  }
+  function stepDt(){
+    const h=DYN.dt/DYN.n_sub;
+    for(let s=0;s<DYN.n_sub;s++){
+      const m=moments(st.th,st.ph,st.ps);
+      st.q=(st.q+(m[0]/DYN.Ipitch)*h)/(1+(DYN.cd_p/DYN.Ipitch)*h);
+      st.p=(st.p+(m[1]/DYN.Iroll)*h)/(1+(DYN.cd_r/DYN.Iroll)*h);
+      st.r=(st.r+(m[2]/DYN.Iyaw)*h)/(1+(DYN.cd_y/DYN.Iyaw)*h);
+      st.th+=st.q*h; st.ph+=st.p*h; st.ps+=st.r*h;
+      st.th=Math.max(-CLP,Math.min(CLP,st.th)); st.ph=wrap(st.ph); st.ps=wrap(st.ps);
+      st.aoa=m[3]; st.lift=m[4];
+    }
+    st.T+=DYN.dt;
+  }
+
+  // ===================== 재생 루프 =====================
+  let playing=false, speed=1, lastTs=null, accum=0;
   function frame(ts){
-    if(holder.clientWidth && holder.clientWidth!==W){
-      W=holder.clientWidth; renderer.setSize(W,H); camera.aspect=W/H; camera.updateProjectionMatrix();
-    }
+    if(holder.clientWidth && holder.clientWidth!==W){ W=holder.clientWidth; renderer.setSize(W,H); camera.aspect=W/H; camera.updateProjectionMatrix(); }
     if(playing){
-      if(last==null)last=ts;
-      const dw=(ts-last)/1000; last=ts;
-      idxF += speed*dw/DATA.dt;
-      if(idxF>=N-1){ if(loop){idxF=0;} else {idxF=N-1;playing=false;} }
-      scrub.value=Math.round(idxF);
-    }
-    show(Math.round(idxF));
-    renderer.render(scene, camera);
+      if(lastTs==null) lastTs=ts;
+      const rdt=Math.min((ts-lastTs)/1000, 0.1); lastTs=ts;
+      accum+=rdt*speed;
+      let steps=Math.floor(accum/DYN.dt); if(steps>300)steps=300; accum-=steps*DYN.dt;
+      for(let s=0;s<steps;s++) stepDt();
+    } else { lastTs=null; }
+    setAttitude(plane, st.th, st.ph, st.ps);
+    hud.innerHTML = 't = '+st.T.toFixed(1)+' s'+(playing?' ▶':' ⏸')+'<br>pitch '+(st.th*R2D).toFixed(1)+
+      '&deg; &nbsp; roll '+(st.ph*R2D).toFixed(1)+'&deg;<br>yaw '+(st.ps*R2D).toFixed(1)+
+      '&deg; &nbsp; AoA '+st.aoa.toFixed(1)+'&deg;';
+    renderer.render(scene,camera);
     requestAnimationFrame(frame);
   }
-  document.getElementById('ac_play').onclick =function(){ if(Math.round(idxF)>=N-1)idxF=0; playing=true; last=null; };
+  document.getElementById('ac_play').onclick =function(){ playing=true; lastTs=null; };
   document.getElementById('ac_pause').onclick=function(){ playing=false; };
-  document.getElementById('ac_stop').onclick =function(){ playing=false; setIdx(0); };
+  document.getElementById('ac_stop').onclick =function(){ playing=false; st=initState(); };
   document.getElementById('ac_speed').onchange=function(e){ speed=parseFloat(e.target.value); };
-  document.getElementById('ac_loop').onchange =function(e){ loop=e.target.checked; };
   document.getElementById('ac_ghost').onchange=function(e){ ghost.visible=e.target.checked; };
-  scrub.oninput=function(e){ playing=false; setIdx(parseInt(e.target.value)); };
 
-  setIdx(0);
   requestAnimationFrame(frame);
 })();
 </script>

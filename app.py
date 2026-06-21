@@ -69,10 +69,11 @@ def compute(cur: dict, aero_model=None):
     if res is None:
         res = simulation.run_simulation(ac, env, init, sim, aero_model=None)
     assess = analysis.overall_assessment(ac, env, res)
+    used_aero = (aero_model is not None and aero_err is None)
     return {"ac": ac, "env": env, "res": res, "assess": assess,
             "cur": copy.deepcopy(cur),
-            "aero": (aero_model is not None and aero_err is None),
-            "aero_err": aero_err}
+            "aero": used_aero, "aero_err": aero_err,
+            "aero_model": aero_model if used_aero else None}
 
 
 # ---------------------------------------------------------------------------
@@ -305,16 +306,19 @@ pcol2.progress(sc / 100.0)
 # ---------------------------------------------------------------------------
 # 🎬 실시간 3D 비행 애니메이션 (브라우저 WebGL/Three.js — 부드럽고 랙 없음)
 # ---------------------------------------------------------------------------
-st.markdown("### 🎬 실시간 3D 비행 애니메이션")
-st.caption("**▶ 재생** 을 누르면 3D 항공기 모델이 실시간으로 pitch·roll·yaw 자세를 보여줍니다. "
+st.markdown("### 🎬 실시간 3D 비행 애니메이션 (연속 시뮬레이션)")
+st.caption("**▶ 재생** 을 누르면 3D 항공기가 **시간 제한 없이 ⏹ 정지를 누를 때까지 계속** "
+           "pitch·roll·yaw 자세를 시뮬레이션합니다(브라우저에서 실시간 적분). "
            "**반투명=초기 자세, 진한 색=현재 자세**. **마우스 드래그=시점 회전, 휠=확대**. "
-           "**⏹ 정지** 를 누르기 전까지 ‘반복’이 켜져 있으면 계속 재생됩니다. "
-           "사이드바 **‘🛩️ 3D 모델 (STL 업로드)’** 에서 원하는 STL 을 올리면 그 모델로 바뀌고, "
-           "아래 **‘모델 조절’** 막대에서 크기·회전을 맞출 수 있습니다.")
+           "사이드바 **‘🛩️ 3D 모델 (STL 업로드)’** 로 모델을 바꾸고 **‘모델 조절’** 로 크기·회전을 맞춥니다. "
+           "(아래 그래프·분석은 입력한 시뮬레이션 시간 구간 기준입니다)")
+_anim_init = initial_from_dict(sim_data["cur"])
+_anim_sim = sim_from_dict(sim_data["cur"])
 components.html(
-    animation.realtime_animation_html(res, vtail_count=ac.vtail.count, stl_b64=stl_b64,
-                                      align_fwd=stl_fwd, align_up=stl_up),
-    height=620, scrolling=False)
+    animation.realtime_animation_html(ac, env, _anim_init, _anim_sim,
+                                      aero_model=sim_data.get("aero_model"),
+                                      stl_b64=stl_b64, align_fwd=stl_fwd, align_up=stl_up),
+    height=640, scrolling=False)
 
 # ---------------------------------------------------------------------------
 # 시간 슬라이더 (아래 정적 그림/그래프 전용)
