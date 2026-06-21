@@ -8,6 +8,7 @@ app.py
 """
 
 from __future__ import annotations
+import base64
 import copy
 import streamlit as st
 
@@ -130,6 +131,23 @@ with st.sidebar.expander("🔧 관성 / 감쇠 / 시간 (심화)"):
     st.slider("시뮬레이션 시간 (s)", 2.0, 60.0, step=1.0, key="t_end")
     st.slider("시간 간격 dt (s)", 0.005, 0.1, step=0.005, key="dt")
 
+stl_b64 = ""
+with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드)"):
+    up = st.file_uploader("STL 파일 (.stl) 업로드", type=["stl"], key="stl_upload")
+    if up is not None:
+        raw = up.getvalue()
+        mb = len(raw) / 1e6
+        if st.checkbox("업로드한 STL 모델 사용", value=True, key="use_stl"):
+            stl_b64 = base64.b64encode(raw).decode()
+        st.caption(f"파일: {up.name} · {mb:.1f} MB")
+        if mb > 6:
+            st.warning("파일이 큽니다(>6MB). 렌더가 느릴 수 있어요. "
+                       "이진(binary) STL 또는 폴리곤 수를 줄인 모델을 권장합니다.")
+        st.caption("업로드 후 애니메이션의 **‘모델 조절’** 막대에서 크기·회전을 맞추세요. "
+                   "CAD(Z-up) 모델은 **‘Z-up 보정’** 버튼이 편합니다.")
+    else:
+        st.caption("업로드하지 않으면 기본 내장 항공기 모델을 사용합니다.")
+
 st.sidebar.markdown("---")
 auto = st.sidebar.checkbox("슬라이더 변경 시 자동 재계산", value=False, key="auto_run")
 run_clicked = st.sidebar.button("▶ 시뮬레이션 시작 / 재시작", type="primary",
@@ -189,10 +207,12 @@ pcol2.progress(sc / 100.0)
 st.markdown("### 🎬 실시간 3D 비행 애니메이션")
 st.caption("**▶ 재생** 을 누르면 3D 항공기 모델이 실시간으로 pitch·roll·yaw 자세를 보여줍니다. "
            "**반투명=초기 자세, 진한 색=현재 자세**. **마우스 드래그=시점 회전, 휠=확대**. "
-           "**⏹ 정지** 를 누르기 전까지 ‘반복’이 켜져 있으면 계속 재생됩니다.")
+           "**⏹ 정지** 를 누르기 전까지 ‘반복’이 켜져 있으면 계속 재생됩니다. "
+           "사이드바 **‘🛩️ 3D 모델 (STL 업로드)’** 에서 원하는 STL 을 올리면 그 모델로 바뀌고, "
+           "아래 **‘모델 조절’** 막대에서 크기·회전을 맞출 수 있습니다.")
 components.html(
-    animation.realtime_animation_html(res, vtail_count=ac.vtail.count),
-    height=560, scrolling=False)
+    animation.realtime_animation_html(res, vtail_count=ac.vtail.count, stl_b64=stl_b64),
+    height=620, scrolling=False)
 
 # ---------------------------------------------------------------------------
 # 시간 슬라이더 (아래 정적 그림/그래프 전용)
