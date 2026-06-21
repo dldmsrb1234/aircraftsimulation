@@ -25,6 +25,7 @@ COL_TAIL_LIFT = "#ff7f0e"
 COL_MOMENT = "#d62728"
 COL_CG = "#000000"
 COL_CP = "#9467bd"
+LEVEL_COLOR = {"ok": "#2e7d32", "warn": "#ef6c00", "danger": "#c62828"}
 
 
 # ===========================================================================
@@ -402,7 +403,93 @@ def attitude_3d_figure(ac: Aircraft, res: SimResult, idx: int):
 
 
 # ===========================================================================
-# 5) 시계열 그래프
+# 5) STL 적용 전 3D 진단
+# ===========================================================================
+def stl_diagnostic_figure(tris: np.ndarray, props: dict, cg_from_nose: float,
+                          stability: dict, max_tris: int = 6000):
+    """STL 적용 전 CG/CP/축 안정성을 3D로 보여주는 미리보기."""
+    fig = go.Figure()
+    V = np.asarray(tris, dtype=float)
+    if len(V) > max_tris:
+        idx = np.random.default_rng(0).choice(len(V), max_tris, replace=False)
+        V = V[idx]
+
+    P = V.reshape(-1, 3)
+    tri_idx = np.arange(len(V) * 3).reshape(-1, 3)
+    fig.add_trace(go.Mesh3d(
+        x=P[:, 0], y=P[:, 2], z=P[:, 1],
+        i=tri_idx[:, 0], j=tri_idx[:, 1], k=tri_idx[:, 2],
+        color="#7aa6d8", opacity=0.58, name="STL 모델",
+        flatshading=True, hoverinfo="skip"))
+
+    allp = np.asarray(tris, dtype=float).reshape(-1, 3)
+    mn, mx = allp.min(0), allp.max(0)
+    c = 0.5 * (mn + mx)
+    nose_x = float(mx[0])
+    cg = np.array([nose_x - float(cg_from_nose), props["cm"][1], props["cm"][2]], dtype=float)
+    cp = np.array([nose_x - float(props["cp_base"]), props["cm"][1], props["cm"][2]], dtype=float)
+    auto_cg = np.array([nose_x - float(props["cg"]), props["cm"][1], props["cm"][2]], dtype=float)
+
+    def plot_point(p, label, color, symbol="circle", size=7):
+        fig.add_trace(go.Scatter3d(
+            x=[p[0]], y=[p[2]], z=[p[1]], mode="markers+text",
+            marker=dict(size=size, color=color, symbol=symbol),
+            text=[label], textposition="top center", name=label))
+
+    plot_point(cg, "현재 CG", COL_CG, "circle", 8)
+    if abs(float(cg_from_nose) - float(props["cg"])) > max(float(props["length"]) * 0.01, 1e-6):
+        plot_point(auto_cg, "자동 CG", "#666666", "diamond", 6)
+    plot_point(cp, "CP", COL_CP, "x", 8)
+
+    fig.add_trace(go.Scatter3d(
+        x=[cg[0], cp[0]], y=[cg[2], cp[2]], z=[cg[1], cp[1]],
+        mode="lines", line=dict(color="#444", width=4),
+        name="CG-CP 거리", hoverinfo="skip"))
+
+    span = max(float(mx[0] - mn[0]), float(mx[1] - mn[1]), float(mx[2] - mn[2]), 1e-6)
+    axis_len = span * 0.28
+    axis_defs = [
+        ("Roll 축", np.array([1.0, 0.0, 0.0]), stability["roll"][1]),
+        ("Pitch 축", np.array([0.0, 0.0, 1.0]), stability["pitch"][1]),
+        ("Yaw 축", np.array([0.0, 1.0, 0.0]), stability["yaw"][1]),
+    ]
+    for label, direction, level in axis_defs:
+        p0 = cg - direction * axis_len
+        p1 = cg + direction * axis_len
+        fig.add_trace(go.Scatter3d(
+            x=[p0[0], p1[0]], y=[p0[2], p1[2]], z=[p0[1], p1[1]],
+            mode="lines+text", text=["", label], textposition="top center",
+            line=dict(color=LEVEL_COLOR.get(level, "#555"), width=7),
+            name=label, hoverinfo="skip"))
+
+    # 기수/바람/바운딩 중심선
+    fig.add_trace(go.Scatter3d(
+        x=[mn[0], mx[0]], y=[c[2], c[2]], z=[c[1], c[1]],
+        mode="lines+text", text=["꼬리", "기수"], textposition="top center",
+        line=dict(color="#1f7ae0", width=5), name="기체 전후축", hoverinfo="skip"))
+    fig.add_trace(go.Scatter3d(
+        x=[mx[0] + span * 0.35, mx[0] + span * 0.05],
+        y=[c[2], c[2]], z=[c[1] + span * 0.18, c[1] + span * 0.18],
+        mode="lines+text", text=["바람", ""], textposition="top center",
+        line=dict(color="#57b0ff", width=6), name="상대풍", hoverinfo="skip"))
+
+    rng = span * 0.68
+    center = np.array([c[0], c[2], c[1]])
+    fig.update_layout(
+        title="STL 적용 전 3D 진단 (CG/CP/축 안정성)",
+        height=520, margin=dict(l=0, r=0, t=42, b=0),
+        scene=dict(
+            xaxis=dict(title="앞(+x) / 뒤", range=[center[0] - rng, center[0] + rng]),
+            yaxis=dict(title="좌 / 우(+z)", range=[center[1] - rng, center[1] + rng]),
+            zaxis=dict(title="아래 / 위(+y)", range=[center[2] - rng, center[2] + rng]),
+            aspectmode="cube",
+            camera=dict(eye=dict(x=1.35, y=1.45, z=0.95))),
+        legend=dict(orientation="h", y=1.0))
+    return fig
+
+
+# ===========================================================================
+# 6) 시계열 그래프
 # ===========================================================================
 def time_series_figure(t, series: list[tuple], title, ylabel, t_now=None, height=300):
     """series: [(y배열, 이름, 색)] 여러 개를 한 그래프에."""

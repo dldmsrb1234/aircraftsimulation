@@ -233,6 +233,13 @@ def pitch_stiffness(model, env_q, cg_point, theta0=0.0, eps=math.radians(3.0)):
     return -(m1 - m0) / (2 * eps)
 
 
+def roll_stiffness(model, env_q, cg_point, eps=math.radians(3.0)):
+    """k_φ = -dM_roll/dφ (>0 이면 roll 복원 경향)."""
+    m1 = body_moments(aero(model, relative_wind_body(0, eps, 0), env_q, cg_point)[1])[0]
+    m0 = body_moments(aero(model, relative_wind_body(0, -eps, 0), env_q, cg_point)[1])[0]
+    return -(m1 - m0) / (2 * eps)
+
+
 def yaw_stiffness(model, env_q, cg_point, eps=math.radians(3.0)):
     """k_ψ = -dM_yaw/dψ (>0 이면 방향 안정)."""
     m1 = body_moments(aero(model, relative_wind_body(0, 0, eps), env_q, cg_point)[1])[2]
@@ -285,8 +292,9 @@ if __name__ == "__main__":
         F,M,al,be = aero(model, w, q, cg)
         print(f"  α={a:4d}  Fy(양력)={F[1]:8.2f} N   M_pitch(Mz)={body_moments(M)[1]:8.3f}")
     kth = pitch_stiffness(model, q, cg)
+    kr = roll_stiffness(model, q, cg)
     kps = yaw_stiffness(model, q, cg)
-    print(f"k_theta = {kth:.3f} (>0 안정),  k_psi = {kps:.3f} (>0 방향안정)")
+    print(f"k_theta = {kth:.3f} (>0 안정),  k_phi = {kr:.3f} (>0 roll 안정),  k_psi = {kps:.3f} (>0 방향안정)")
     # CG 를 뒤로(0.06→-0.30) 옮기면 불안정해져야
     cg_aft = np.array([-0.30, 0.0, 0.0])
     print(f"CG 뒤로: k_theta = {pitch_stiffness(model, q, cg_aft):.3f} (<0 불안정 기대)")
