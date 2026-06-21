@@ -38,6 +38,27 @@ streamlit run app.py
 ```
 브라우저가 자동으로 열리지 않으면 터미널에 표시된 `Local URL`(예: http://localhost:8501)로 접속합니다.
 
+## 2-1. 공개 사이트로 배포 (누구나 접속) — 무료
+
+### 방법 A. Streamlit Community Cloud (권장)
+1. [github.com](https://github.com) 계정 생성 → **새 public 저장소** 만들기(빈 저장소).
+2. 이 폴더에서(이미 git 커밋 완료됨):
+   ```bash
+   git remote add origin https://github.com/<아이디>/<저장소이름>.git
+   git push -u origin main
+   ```
+3. [share.streamlit.io](https://share.streamlit.io) → GitHub 로그인 → **New app**
+   → 저장소 선택, branch `main`, **Main file path = `app.py`** → **Deploy**.
+4. `https://<이름>.streamlit.app` 공개 URL 생성 → 누구나 접속 가능.
+
+### 방법 B. Hugging Face Spaces (GitHub 없이도 가능)
+1. [huggingface.co](https://huggingface.co) 계정 → **New Space** → SDK = **Streamlit**.
+2. `app.py`, 모든 `*.py`, `requirements.txt`, `.streamlit/config.toml` 을 업로드.
+3. 자동 빌드 후 공개 URL 제공.
+
+> 참고: 3D 애니메이션의 Three.js 는 CDN 에서 로드되므로 배포 사이트에서도 그대로 동작합니다.
+> 무료 플랜 앱은 한동안 접속이 없으면 잠들 수 있으나, 접속하면 다시 깨어납니다.
+
 ---
 
 ## 3. 사용 방법 (UI 설명)
