@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import copy
 import math
+import numpy as np
 import streamlit as st
 
 import presets
@@ -22,6 +23,7 @@ import physics
 import visualization as viz
 import animation
 import stl_analysis
+import panel_aero
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="항공기 비행 양상 시뮬레이터",
@@ -52,14 +54,15 @@ def badge(text: str, level: str) -> str:
             f"border-radius:12px;font-size:0.85em;white-space:nowrap'>{text}</span>")
 
 
-def compute(cur: dict):
+def compute(cur: dict, aero_model=None):
     ac = aircraft_from_dict(cur)
     env = environment_from_dict(cur)
     init = initial_from_dict(cur)
     sim = sim_from_dict(cur)
-    res = simulation.run_simulation(ac, env, init, sim)
+    res = simulation.run_simulation(ac, env, init, sim, aero_model=aero_model)
     assess = analysis.overall_assessment(ac, env, res)
-    return {"ac": ac, "env": env, "res": res, "assess": assess, "cur": copy.deepcopy(cur)}
+    return {"ac": ac, "env": env, "res": res, "assess": assess,
+            "cur": copy.deepcopy(cur), "aero": aero_model is not None}
 
 
 # ---------------------------------------------------------------------------
@@ -187,11 +190,21 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 geo["cd_yaw"] = 2 * zeta * math.sqrt(k_ps * geo["Iz"])
                 geo["cd_roll"] = geo["Ix"] * 3.0   # roll 복원 없음 → 시간상수 기반
 
+                # 표면 패널 공력 모델 생성(정렬 메시 + 무게중심점)
+                V = stl_analysis.align_mesh(tris, stl_fwd, stl_up)
+                aero_model = panel_aero.build_aero_model(V, np.asarray(props["cm"]))
+                q0 = 0.5 * float(st.session_state["rho"]) * float(st.session_state["V"]) ** 2
+                cgp = panel_aero.cg_point_from_nose(aero_model, geo["cg"])
+                props["k_theta_panel"] = panel_aero.pitch_stiffness(aero_model, q0, cgp)
+                props["k_psi_panel"] = panel_aero.yaw_stiffness(aero_model, q0, cgp)
+
                 props["k_theta"] = k_th_signed
                 props["static_margin"] = geo["cp_base"] - geo["cg"]
+                st.session_state["_aero_model"] = aero_model
                 st.session_state["_stl_props"] = geo
                 st.session_state["_apply_stl"] = True
                 st.session_state["_stl_report"] = props
+                st.session_state["sim"] = None         # 즉시 재계산되도록
                 st.rerun()
             except Exception as e:
                 st.error(f"STL 분석 실패: {e}")
@@ -203,10 +216,12 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 f"- 길이 {rp['length']:.3g} m · 날개폭 {rp['span']:.3g} m · 높이 {rp['height']:.3g} m\n"
                 f"- 주날개 면적 {rp['S_wing']:.3g} m² · 수평꼬리 {rp['S_htail']:.2g} m²\n"
                 f"- CG {rp['cg']:.3g} m · CP {rp['cp_base']:.3g} m (기수 기준)\n"
-                f"- Ix {rp['Ix']:.2e} · Iy {rp['Iy']:.2e} · Iz {rp['Iz']:.2e} kg·m²")
-            if rp.get("k_theta", 1) <= 0:
+                f"- Ix {rp['Ix']:.2e} · Iy {rp['Iy']:.2e} · Iz {rp['Iz']:.2e} kg·m²\n"
+                f"- 표면 패널 공력 적용(세로강성 k_θ={rp.get('k_theta_panel', 0):.2f}, "
+                f"방향강성 k_ψ={rp.get('k_psi_panel', 0):.2f})")
+            if rp.get("k_theta_panel", rp.get("k_theta", 1)) <= 0:
                 st.warning(
-                    "⚠️ 이 형상은 **정적으로 불안정**(양력중심이 무게중심보다 앞)하여 "
+                    "⚠️ 이 형상은 **세로 정적 불안정**(무게중심이 양력중심보다 뒤)하여 "
                     "기수가 점점 들리거나 숙여지며 **발산**합니다. 실제 모형도 이대로면 뒤집힙니다.\n\n"
                     "→ **무게중심(CG)을 앞으로** 옮기세요(기수에 무게추). 사이드바 ‘무게중심 CG’ 값을 "
                     f"현재 CP({rp['cp_base']:.3g} m)보다 **작게**(앞으로) 조정한 뒤 다시 시작하면 안정화됩니다. "
@@ -230,9 +245,11 @@ cur["name"] = preset_name
 # ---------------------------------------------------------------------------
 # 시뮬레이션 실행 결정
 # ---------------------------------------------------------------------------
+# STL 을 사용 중이고 패널 공력 모델이 있으면 그것으로 동역학 계산
+aero_model = st.session_state.get("_aero_model") if stl_b64 else None
 need = (st.session_state.get("sim") is None) or run_clicked or auto
 if need:
-    st.session_state["sim"] = compute(cur)
+    st.session_state["sim"] = compute(cur, aero_model)
 
 sim_data = st.session_state["sim"]
 ac, env, res, assess = sim_data["ac"], sim_data["env"], sim_data["res"], sim_data["assess"]

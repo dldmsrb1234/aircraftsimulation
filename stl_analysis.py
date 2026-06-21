@@ -205,9 +205,10 @@ def analyze(tris: np.ndarray, fwd: str, up: str, mass: float) -> dict:
     vol = abs(vol)
     x_cg = nose - float(cm[0]) if vol > 1e-12 else nose - 0.5 * length
     dens = (mass / vol) if vol > 1e-12 else 0.0
-    Ix = float(Idiag[0] * dens)               # roll  (x)
-    Iy = float(Idiag[1] * dens)               # pitch (y)
-    Iz = float(Idiag[2] * dens)               # yaw   (z)
+    # 회전축 매핑: roll=전후축(x), pitch=가로축(z, 측), yaw=수직축(y, 위)
+    Ix = float(Idiag[0] * dens)               # roll  (x, 전후)
+    Iy = float(Idiag[2] * dens)               # pitch (z, 가로)
+    Iz = float(Idiag[1] * dens)               # yaw   (y, 수직)
 
     return {
         "length": length, "span": span, "height": height,
@@ -219,7 +220,14 @@ def analyze(tris: np.ndarray, fwd: str, up: str, mass: float) -> dict:
         "Ix": max(Ix, 1e-9), "Iy": max(Iy, 1e-9), "Iz": max(Iz, 1e-9),
         "volume": vol, "frontal_area": float((np.maximum(0, unit[:, 0]) * area).sum()),
         "n_tri": int(len(tris)),
+        "cm": [float(cm[0]), float(cm[1]), float(cm[2])],   # 정렬프레임 무게중심점
     }
+
+
+def align_mesh(tris: np.ndarray, fwd: str, up: str) -> np.ndarray:
+    """삼각형 메시를 표준 기체프레임(x=앞,y=위,z=측)으로 회전한 배열 반환."""
+    R = align_matrix(fwd, up)
+    return (tris.reshape(-1, 3) @ R.T).reshape(-1, 3, 3)
 
 
 # ---------------------------------------------------------------------------

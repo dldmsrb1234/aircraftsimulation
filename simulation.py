@@ -48,8 +48,13 @@ class SimResult:
 
 
 def run_simulation(ac: Aircraft, env: Environment,
-                   init: InitialState, sim: SimConfig) -> SimResult:
-    """전체 시뮬레이션 실행 후 SimResult 반환."""
+                   init: InitialState, sim: SimConfig,
+                   aero_model: dict | None = None) -> SimResult:
+    """전체 시뮬레이션 실행 후 SimResult 반환.
+
+    aero_model 이 주어지면 STL 표면 패널 공력으로 모멘트를 계산하고,
+    없으면 매개변수(면적·CP·CG) 모델을 사용한다.
+    """
     n = int(round(sim.t_end / sim.dt)) + 1
     n = max(n, 2)
 
@@ -61,23 +66,48 @@ def run_simulation(ac: Aircraft, env: Environment,
     p_rate = math.radians(init.p0_deg)       # roll  각속도
     r_rate = math.radians(init.r0_deg)       # yaw   각속도
 
-    # 감쇠계수 (사용자 배율 적용)
-    cd_p = ac.cd_pitch * sim.damping_mult
-    cd_r = ac.cd_roll * sim.damping_mult
-    cd_y = ac.cd_yaw * sim.damping_mult
+    q_dyn = physics.dynamic_pressure(env.rho, env.V)
+    I_pitch, I_roll, I_yaw = ac.Iy, ac.Ix, ac.Iz
 
-    # 수치 안정성: 내부 서브스텝
-    #   고유진동수 ω=√(k/I) 가 크면(작은 모델 등) ω·h<1.5 가 되도록 dt 를 잘게 쪼갠다.
-    #   감쇠는 아래 적분에서 '암시적'으로 처리하므로 감쇠가 커도 발산하지 않는다.
-    k_th = abs(physics.pitch_stiffness(ac, env, 0.0))
-    k_ps = abs(physics.yaw_stiffness(ac, env))
-    w_pitch = math.sqrt(k_th / ac.Iy) if ac.Iy > 0 else 0.0
-    w_yaw = math.sqrt(k_ps / ac.Iz) if ac.Iz > 0 else 0.0
+    # --- 모멘트 제공자: STL 패널 공력(aero_model) 또는 매개변수 모델 ---
+    if aero_model is not None:
+        import panel_aero
+        cg_point = panel_aero.cg_point_from_nose(aero_model, ac.cg)   # 슬라이더 CG 반영
+        k_th = abs(panel_aero.pitch_stiffness(aero_model, q_dyn, cg_point))
+        k_ps = abs(panel_aero.yaw_stiffness(aero_model, q_dyn, cg_point))
+        zeta = 0.4
+        cd_p = 2 * zeta * math.sqrt(max(k_th, 1e-12) * I_pitch) * sim.damping_mult
+        cd_y = 2 * zeta * math.sqrt(max(k_ps, 1e-12) * I_yaw) * sim.damping_mult
+        cd_r = I_roll * 3.0 * sim.damping_mult
+
+        def moments(th, ph, ps_):
+            w = panel_aero.relative_wind_body(th, ph, ps_)
+            F, M, al, _ = panel_aero.aero(aero_model, w, q_dyn, cg_point)
+            mr, mp, my = panel_aero.body_moments(M)
+            fy = F[1] if abs(F[1]) > 1e-6 else 1e-6
+            cp = float(np.clip(ac.cg - mp / fy, 0.0, max(ac.length, 1e-3)))
+            return mp, mr, my, (math.degrees(al), cp, float(F[1]), float(-F[0]))
+    else:
+        cd_p = ac.cd_pitch * sim.damping_mult
+        cd_r = ac.cd_roll * sim.damping_mult
+        cd_y = ac.cd_yaw * sim.damping_mult
+        k_th = abs(physics.pitch_stiffness(ac, env, 0.0))
+        k_ps = abs(physics.yaw_stiffness(ac, env))
+
+        def moments(th, ph, ps_):
+            ps = physics.pitch_state(ac, env, th)
+            rs = physics.roll_moment(ac, env, ph)
+            ys = physics.yaw_moment(ac, env, ps_)
+            return (ps["M_pitch"], rs["M_roll"], ys["M_yaw"],
+                    (ps["alpha_wing_deg"], ps["x_cp"], ps["L_wing"], ps["L_tail"]))
+
+    # 수치 안정성: ω·h<1.5 가 되도록 dt 를 내부 서브스텝으로 분할
+    w_pitch = math.sqrt(k_th / I_pitch) if I_pitch > 0 else 0.0
+    w_yaw = math.sqrt(k_ps / I_yaw) if I_yaw > 0 else 0.0
     w_max = max(w_pitch, w_yaw, 1e-9)
     n_sub = int(min(200, max(1, math.ceil(sim.dt * w_max / 1.5))))
     h = sim.dt / n_sub
 
-    # 기록 버퍼
     rec = {k: np.zeros(n) for k in (
         "t", "pitch", "roll", "yaw", "aoa", "cp",
         "L_wing", "L_tail", "M_pitch", "M_roll", "M_yaw",
@@ -86,36 +116,28 @@ def run_simulation(ac: Aircraft, env: Environment,
     LO_T, HI_T, LIM = math.radians(-90), math.radians(90), math.radians(180)
 
     for i in range(n):
-        # --- 현재 상태에서의 공력/모멘트 (기록용) ---
-        ps = physics.pitch_state(ac, env, theta)
-        rs = physics.roll_moment(ac, env, phi)
-        ys = physics.yaw_moment(ac, env, psi)
-
+        mp, mr, my, aux = moments(theta, phi, psi)
         rec["t"][i] = i * sim.dt
         rec["pitch"][i] = math.degrees(theta)
         rec["roll"][i] = math.degrees(phi)
         rec["yaw"][i] = math.degrees(psi)
-        rec["aoa"][i] = ps["alpha_wing_deg"]
-        rec["cp"][i] = ps["x_cp"]
-        rec["L_wing"][i] = ps["L_wing"]
-        rec["L_tail"][i] = ps["L_tail"]
-        rec["M_pitch"][i] = ps["M_pitch"]
-        rec["M_roll"][i] = rs["M_roll"]
-        rec["M_yaw"][i] = ys["M_yaw"]
+        rec["aoa"][i] = aux[0]
+        rec["cp"][i] = aux[1]
+        rec["L_wing"][i] = aux[2]
+        rec["L_tail"][i] = aux[3]
+        rec["M_pitch"][i] = mp
+        rec["M_roll"][i] = mr
+        rec["M_yaw"][i] = my
         rec["pitch_rate"][i] = math.degrees(q_rate)
         rec["roll_rate"][i] = math.degrees(p_rate)
         rec["yaw_rate"][i] = math.degrees(r_rate)
 
-        # --- dt 를 n_sub 개의 반암시적 스텝으로 적분 ---
-        #   각속도: rate_new = (rate + (M/I)·h) / (1 + (c/I)·h)
-        #   → 감쇠 항이 분모로 들어가 c 가 아무리 커도 |계수|<1 (무조건 안정)
+        # 반암시적 적분: rate=(rate+(M/I)·h)/(1+(c/I)·h)  (감쇠 무조건 안정)
         for _ in range(n_sub):
-            mp = physics.pitch_state(ac, env, theta)["M_pitch"]
-            mr = physics.roll_moment(ac, env, phi)["M_roll"]
-            my = physics.yaw_moment(ac, env, psi)["M_yaw"]
-            q_rate = (q_rate + (mp / ac.Iy) * h) / (1.0 + (cd_p / ac.Iy) * h)
-            p_rate = (p_rate + (mr / ac.Ix) * h) / (1.0 + (cd_r / ac.Ix) * h)
-            r_rate = (r_rate + (my / ac.Iz) * h) / (1.0 + (cd_y / ac.Iz) * h)
+            mp, mr, my, _ = moments(theta, phi, psi)
+            q_rate = (q_rate + (mp / I_pitch) * h) / (1.0 + (cd_p / I_pitch) * h)
+            p_rate = (p_rate + (mr / I_roll) * h) / (1.0 + (cd_r / I_roll) * h)
+            r_rate = (r_rate + (my / I_yaw) * h) / (1.0 + (cd_y / I_yaw) * h)
             theta += q_rate * h
             phi += p_rate * h
             psi += r_rate * h
