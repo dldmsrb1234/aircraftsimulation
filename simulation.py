@@ -49,7 +49,7 @@ class SimResult:
 
 def run_simulation(ac: Aircraft, env: Environment,
                    init: InitialState, sim: SimConfig,
-                   aero_model: dict | None = None) -> SimResult:
+                   aero_model=None) -> SimResult:
     """전체 시뮬레이션 실행 후 SimResult 반환.
 
     aero_model 이 주어지면 STL 표면 패널 공력으로 모멘트를 계산하고,
@@ -84,9 +84,10 @@ def run_simulation(ac: Aircraft, env: Environment,
             w = panel_aero.relative_wind_body(th, ph, ps_)
             F, M, al, _ = panel_aero.aero(aero_model, w, q_dyn, cg_point)
             mr, mp, my = panel_aero.body_moments(M)
-            fy = F[1] if abs(F[1]) > 1e-6 else 1e-6
+            mr, mp, my = float(mr), float(mp), float(my)     # 순수 float 로 고정
+            fy = float(F[1]) if abs(float(F[1])) > 1e-6 else 1e-6
             cp = float(np.clip(ac.cg - mp / fy, 0.0, max(ac.length, 1e-3)))
-            return mp, mr, my, (math.degrees(al), cp, float(F[1]), float(-F[0]))
+            return mp, mr, my, (math.degrees(float(al)), cp, float(F[1]), float(-F[0]))
     else:
         cd_p = ac.cd_pitch * sim.damping_mult
         cd_r = ac.cd_roll * sim.damping_mult

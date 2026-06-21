@@ -59,10 +59,20 @@ def compute(cur: dict, aero_model=None):
     env = environment_from_dict(cur)
     init = initial_from_dict(cur)
     sim = sim_from_dict(cur)
-    res = simulation.run_simulation(ac, env, init, sim, aero_model=aero_model)
+    aero_err = None
+    res = None
+    if aero_model is not None:
+        try:
+            res = simulation.run_simulation(ac, env, init, sim, aero_model=aero_model)
+        except Exception as e:           # 패널 공력 실패 시 매개변수 모델로 안전 대체
+            aero_err = f"{type(e).__name__}: {e}"
+    if res is None:
+        res = simulation.run_simulation(ac, env, init, sim, aero_model=None)
     assess = analysis.overall_assessment(ac, env, res)
     return {"ac": ac, "env": env, "res": res, "assess": assess,
-            "cur": copy.deepcopy(cur), "aero": aero_model is not None}
+            "cur": copy.deepcopy(cur),
+            "aero": (aero_model is not None and aero_err is None),
+            "aero_err": aero_err}
 
 
 # ---------------------------------------------------------------------------
@@ -265,6 +275,10 @@ st.caption("받음각·무게중심·양력중심·꼬리날개 조건에 따른
 if pending_changed:
     st.info("입력값이 바뀌었습니다. 좌측 **▶ 시뮬레이션 시작/재시작** 을 눌러 반영하세요. "
             "(현재 화면은 직전에 계산된 결과입니다.)")
+
+if sim_data.get("aero_err"):
+    st.error("⚠️ STL 표면 패널 공력 계산 중 오류가 발생해 매개변수 모델로 대체했습니다. "
+             f"원인: `{sim_data['aero_err']}` — 이 메시지를 알려주시면 정확히 고치겠습니다.")
 
 # 경고
 aoa_max = float(max(abs(res.aoa.min()), abs(res.aoa.max())))

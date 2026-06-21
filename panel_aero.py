@@ -140,10 +140,11 @@ _W_WORLD = np.array([-1.0, 0.0, 0.0])   # 바람: 정면(+x)에서 불어옴(공
 
 def relative_wind_body(theta, phi, psi):
     """pitch θ, roll φ, yaw ψ(rad) 에서 기체프레임 상대풍 단위벡터."""
+    theta, phi, psi = float(theta), float(phi), float(psi)   # numpy 스칼라 방지
     R_bw = _Ry(-psi) @ _Rz(theta) @ _Rx(phi)     # 기체→세계 (애니메이션과 동일 규약)
     w = R_bw.T @ _W_WORLD
-    n = np.linalg.norm(w)
-    return w / n if n > 0 else _W_WORLD
+    n = float(np.linalg.norm(w))
+    return w / n if n > 0 else _W_WORLD.copy()
 
 
 def body_moments(M):
