@@ -63,9 +63,11 @@ def badge(text: str, level: str) -> str:
 
 
 def stl_signature(raw: bytes, fwd: str, up: str, unit_label: str,
-                  physics_scale: float, quality: str) -> str:
+                  physics_scale: float, quality: str,
+                  pre_rot: tuple[float, float, float]) -> str:
     h = hashlib.sha1(raw).hexdigest()[:16]
-    return f"{h}:{fwd}:{up}:{unit_label}:{physics_scale:.6g}:{quality}"
+    rx, ry, rz = pre_rot
+    return f"{h}:{fwd}:{up}:{unit_label}:{physics_scale:.6g}:{quality}:{rx:.3f}:{ry:.3f}:{rz:.3f}"
 
 
 def inertia_with_cg_override(props: dict, mass: float, cg_from_nose: float) -> tuple[float, float, float]:
@@ -110,17 +112,29 @@ def tendency_status(angle_deg: float, moment: float,
     return "현재 자세에서 복원 방향", "ok"
 
 
+def moment_direction(axis: str, moment: float) -> str:
+    if axis == "pitch":
+        return "기수 들림" if moment >= 0 else "기수 숙임"
+    if axis == "roll":
+        return "우측 날개 내려감" if moment >= 0 else "좌측 날개 내려감"
+    if axis == "yaw":
+        return "기수 우향" if moment >= 0 else "기수 좌향"
+    return "중립"
+
+
 def make_stl_preview(raw: bytes, fwd: str, up: str, unit_factor: float,
                      mass: float, cg_mode: str, cg_ratio: float | None,
-                     cg_m: float | None, cur_values: dict) -> dict:
+                     cg_m: float | None, cur_values: dict,
+                     pre_rot: tuple[float, float, float]) -> dict:
     tris = stl_analysis.parse_stl(raw) * unit_factor
-    props = stl_analysis.analyze(tris, fwd, up, mass)
+    aligned = stl_analysis.align_mesh(tris, fwd, up)
+    rotated = stl_analysis.rotate_mesh(aligned, *pre_rot)
+    props = stl_analysis.analyze(rotated, "+X", "+Y", mass)
     cg_from_nose = cg_from_stl_settings(
         props, cg_mode, float(cur_values["cg"]), cg_ratio, cg_m)
     Ix, Iy, Iz = inertia_with_cg_override(props, mass, cg_from_nose)
-    aligned = stl_analysis.align_mesh(tris, fwd, up)
     model = panel_aero.build_aero_model(
-        aligned, np.asarray(props["cm"]), **STL_PREVIEW_QUALITY)
+        rotated, np.asarray(props["cm"]), **STL_PREVIEW_QUALITY)
     q_dyn = physics.dynamic_pressure(float(cur_values["rho"]), float(cur_values["V"]))
     cgp = panel_aero.cg_point_from_nose(model, cg_from_nose)
     k_pitch = panel_aero.pitch_stiffness(model, q_dyn, cgp)
@@ -137,14 +151,20 @@ def make_stl_preview(raw: bytes, fwd: str, up: str, unit_factor: float,
     p_stiff = stiffness_status(k_pitch, tol)
     r_stiff = stiffness_status(k_roll, tol)
     y_stiff = stiffness_status(k_yaw, tol)
-    stability = {
-        "pitch": (*tendency_status(float(cur_values["pitch0"]), m_pitch, *p_stiff),
-                  k_pitch, m_pitch),
-        "roll": (*tendency_status(float(cur_values["roll0"]), m_roll, *r_stiff),
-                 k_roll, m_roll),
-        "yaw": (*tendency_status(float(cur_values["yaw0"]), m_yaw, *y_stiff),
-                k_yaw, m_yaw),
-    }
+    stability = {}
+    for axis, angle, moment, stiff in (
+        ("pitch", float(cur_values["pitch0"]), m_pitch, p_stiff),
+        ("roll", float(cur_values["roll0"]), m_roll, r_stiff),
+        ("yaw", float(cur_values["yaw0"]), m_yaw, y_stiff),
+    ):
+        label, level = tendency_status(angle, moment, *stiff)
+        stability[axis] = {
+            "label": label,
+            "level": level,
+            "k": {"pitch": k_pitch, "roll": k_roll, "yaw": k_yaw}[axis],
+            "moment": float(moment),
+            "direction": moment_direction(axis, float(moment)),
+        }
     props = dict(props)
     props.update({
         "cg_applied": cg_from_nose, "cg_auto": float(props["cg"]),
@@ -152,7 +172,7 @@ def make_stl_preview(raw: bytes, fwd: str, up: str, unit_factor: float,
         "beta_preview": math.degrees(float(beta)), "L_preview": float(F[1]),
         "D_preview": float(-F[0]), "n_tri_preview": int(model["n_tri"]),
     })
-    return {"tris": aligned, "props": props, "cg": cg_from_nose,
+    return {"tris": rotated, "props": props, "cg": cg_from_nose,
             "stability": stability}
 
 
@@ -271,6 +291,8 @@ stl_fwd, stl_up = "+X", "+Y"
 stl_sig_current = None
 stl_preview = None
 stl_preview_error = None
+stl_pre_rot = (0.0, 0.0, 0.0)
+stl_axis_ok = True
 _UNIT = {"mm (밀리미터)": 0.001, "cm (센티미터)": 0.01, "m (미터)": 1.0}
 with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
     up = st.file_uploader("STL 파일 (.stl) 업로드", type=["stl"], key="stl_upload")
@@ -286,6 +308,12 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
         "물리 크기 배율 (ray/면적/관성에 반영)", 0.10, 5.00, step=0.05,
         value=float(st.session_state.get("stl_physics_scale", 1.0)),
         key="stl_physics_scale")
+    st.caption("적용 전 방향 미세회전: 축 선택 후 표준 기체프레임에서 회전합니다.")
+    r_x, r_y, r_z = st.columns(3)
+    stl_pre_rx = r_x.slider("X/roll", -180.0, 180.0, 0.0, step=1.0, key="stl_pre_rx")
+    stl_pre_ry = r_y.slider("Y/yaw", -180.0, 180.0, 0.0, step=1.0, key="stl_pre_ry")
+    stl_pre_rz = r_z.slider("Z/pitch", -180.0, 180.0, 0.0, step=1.0, key="stl_pre_rz")
+    stl_pre_rot = (float(stl_pre_rx), float(stl_pre_ry), float(stl_pre_rz))
     stl_cg_mode = st.selectbox(
         "무게중심(CG) 지정", ["STL 균일밀도 자동", "현재 입력 CG 사용", "기수 기준 비율", "기수 기준 거리(m)"],
         key="stl_cg_mode")
@@ -306,38 +334,39 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
         if mb > 6:
             st.warning("파일이 큽니다(>6MB). 렌더가 느릴 수 있어요. "
                        "이진(binary) STL / 폴리곤 수 줄인 모델 권장.")
-        axis_ok = True
+        stl_axis_ok = True
         try:
             stl_analysis.align_matrix(stl_fwd, stl_up)
         except ValueError as e:
-            axis_ok = False
+            stl_axis_ok = False
             st.error(str(e))
 
         stl_sig_current = stl_signature(raw, stl_fwd, stl_up, unit_label,
-                                        stl_physics_scale, stl_quality)
+                                        stl_physics_scale, stl_quality, stl_pre_rot)
         applied_sig = st.session_state.get("_aero_signature")
         if applied_sig and applied_sig != stl_sig_current:
-            st.info("STL 파일/축/단위/물리 크기/정밀도 설정이 바뀌었습니다. "
+            st.info("STL 파일/축/단위/물리 크기/적용 전 회전/정밀도 설정이 바뀌었습니다. "
                     "ray 물리에 반영하려면 아래 적용 버튼을 다시 누르세요.")
-        if axis_ok and stl_show_preview:
+        if stl_axis_ok and stl_show_preview:
             try:
                 preview_cur = {k: st.session_state[k] for k in INPUT_KEYS}
                 stl_preview = make_stl_preview(
                     raw, stl_fwd, stl_up,
                     _UNIT[unit_label] * float(stl_physics_scale),
                     float(stl_mass), stl_cg_mode, stl_cg_ratio, stl_cg_m,
-                    preview_cur)
+                    preview_cur, stl_pre_rot)
             except Exception as e:
                 stl_preview_error = f"{type(e).__name__}: {e}"
                 st.warning(f"적용 전 3D 진단 생성 실패: {stl_preview_error}")
 
         if st.button("📐 STL 형상의 항공역학 특성 적용", width='stretch',
-                     disabled=not axis_ok):
+                     disabled=not stl_axis_ok):
             try:
                 factor = _UNIT[unit_label] * float(stl_physics_scale)
                 tris = stl_analysis.parse_stl(raw) * factor
-                props = stl_analysis.analyze(tris, stl_fwd, stl_up,
-                                             float(stl_mass))
+                V = stl_analysis.align_mesh(tris, stl_fwd, stl_up)
+                V = stl_analysis.rotate_mesh(V, *stl_pre_rot)
+                props = stl_analysis.analyze(V, "+X", "+Y", float(stl_mass))
                 cg_from_nose = cg_from_stl_settings(
                     props, stl_cg_mode, float(st.session_state["cg"]),
                     stl_cg_ratio, stl_cg_m)
@@ -354,7 +383,6 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 geo["cp_auto"] = False
 
                 # 표면 패널 공력 모델 생성(정렬 메시 + 무게중심점)
-                V = stl_analysis.align_mesh(tris, stl_fwd, stl_up)
                 aero_model = panel_aero.build_aero_model(
                     V, np.asarray(props["cm"]), **STL_QUALITY[stl_quality])
                 q0 = 0.5 * float(st.session_state["rho"]) * float(st.session_state["V"]) ** 2
@@ -375,6 +403,7 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 props["static_margin"] = geo["cp_base"] - geo["cg"]
                 props["physics_scale"] = float(stl_physics_scale)
                 props["quality"] = stl_quality
+                props["pre_rot"] = [float(v) for v in stl_pre_rot]
                 st.session_state["_aero_model"] = aero_model
                 st.session_state["_aero_signature"] = stl_sig_current
                 st.session_state["_stl_props"] = geo
@@ -394,6 +423,8 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 f"- CG {rp.get('cg_applied', rp['cg']):.3g} m "
                 f"(자동 추정 {rp.get('cg_auto', rp['cg']):.3g} m) · CP {rp['cp_base']:.3g} m\n"
                 f"- 물리 크기 배율 {rp.get('physics_scale', 1.0):.2f}×\n"
+                f"- 적용 전 회전 X/Y/Z = {rp.get('pre_rot', [0, 0, 0])[0]:.0f}° / "
+                f"{rp.get('pre_rot', [0, 0, 0])[1]:.0f}° / {rp.get('pre_rot', [0, 0, 0])[2]:.0f}°\n"
                 f"- Ix {rp['Ix']:.2e} · Iy {rp['Iy']:.2e} · Iz {rp['Iz']:.2e} kg·m²\n"
                 f"- 표면 패널 공력 적용(세로강성 k_θ={rp.get('k_theta_panel', 0):.2f}, "
                 f"방향강성 k_ψ={rp.get('k_psi_panel', 0):.2f})")
@@ -404,7 +435,7 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                     "→ **무게중심(CG)을 앞으로** 옮기세요(기수에 무게추). 사이드바 ‘무게중심 CG’ 값을 "
                     f"현재 CP({rp['cp_base']:.3g} m)보다 **작게**(앞으로) 조정한 뒤 다시 시작하면 안정화됩니다. "
                     "(균일밀도 가정이라 실제 무게추 위치와 다를 수 있어요.)")
-        st.caption("① 기수/위 축·단위·질량·물리 크기·CG 를 먼저 정하고 → "
+        st.caption("① 기수/위 축·단위·질량·물리 크기·적용 전 회전·CG 를 먼저 정하고 → "
                    "② **‘적용’** 을 누르면 길이·면적·CG·CP·관성·ray 공력표가 함께 반영됩니다. "
                    "이후 **▶ 시뮬레이션 시작/재시작**.")
     else:
@@ -426,6 +457,7 @@ cur["name"] = preset_name
 # STL 을 사용 중이고 패널 공력 모델이 있으면 그것으로 동역학 계산
 aero_ready = (
     bool(stl_b64)
+    and stl_axis_ok
     and st.session_state.get("_aero_model") is not None
     and st.session_state.get("_aero_signature") == stl_sig_current
 )
@@ -490,8 +522,8 @@ pcol2.progress(sc / 100.0)
 if stl_preview is not None:
     pp = stl_preview["props"]
     st.markdown("### 🧭 STL 적용 전 3D 진단")
-    st.caption("아래 내용은 **아직 적용 버튼을 누르기 전** 현재 STL 설정(축·단위·질량·물리 크기·CG)으로 "
-               "빠르게 계산한 미리보기입니다. 3D 그림에서 검은 점=현재 CG, 보라색 X=CP입니다.")
+    st.caption("아래 내용은 **아직 적용 버튼을 누르기 전** 현재 STL 설정(축·단위·질량·물리 크기·회전·CG)으로 "
+               "빠르게 계산한 미리보기입니다. 3D 그림에서 검은 점=현재 CG, 보라색 X=CP, 굵은 화살표=현재 모멘트/발산 방향입니다.")
 
     d1, d2, d3, d4 = st.columns(4)
     d1.metric("CG / CP", f"{pp['cg_applied']:.3g} / {pp['cp_base']:.3g} m",
@@ -507,21 +539,26 @@ if stl_preview is not None:
     for col, name, key in [(s1, "Pitch 발산 여부", "pitch"),
                            (s2, "Roll 발산 여부", "roll"),
                            (s3, "Yaw 발산 여부", "yaw")]:
-        label, lvl, k_val, m_val = stl_preview["stability"][key]
+        info = stl_preview["stability"][key]
+        label, lvl = info["label"], info["level"]
+        k_val, m_val = info["k"], info["moment"]
         col.markdown(f"**{name}**<br>{badge(label, lvl)}", unsafe_allow_html=True)
-        col.caption(f"k={k_val:.3g} N·m/rad · 현재 모멘트={m_val:.3g} N·m")
+        col.caption(f"방향: {info['direction']} · k={k_val:.3g} N·m/rad · 현재 모멘트={m_val:.3g} N·m")
 
     st.plotly_chart(
         viz.stl_diagnostic_figure(
             stl_preview["tris"], pp, pp["cg_applied"], stl_preview["stability"]),
         width='stretch')
 
-    if stl_preview["stability"]["pitch"][1] == "danger":
-        st.warning("Pitch가 현재 설정에서 발산 방향입니다. CG를 앞으로 옮기거나 수평꼬리/질량/크기를 조정해 보세요.")
-    if stl_preview["stability"]["roll"][1] == "danger":
-        st.warning("Roll이 현재 설정에서 발산 방향입니다. 좌우 형상 비대칭 또는 기울어진 축 정렬을 확인해 보세요.")
-    if stl_preview["stability"]["yaw"][1] == "danger":
-        st.warning("Yaw가 현재 설정에서 발산 방향입니다. 수직꼬리 형상/축 정렬/CG 위치를 확인해 보세요.")
+    if stl_preview["stability"]["pitch"]["level"] == "danger":
+        st.warning(f"Pitch가 **{stl_preview['stability']['pitch']['direction']}** 쪽으로 발산합니다. "
+                   "CG를 앞으로 옮기거나 수평꼬리/질량/크기를 조정해 보세요.")
+    if stl_preview["stability"]["roll"]["level"] == "danger":
+        st.warning(f"Roll이 **{stl_preview['stability']['roll']['direction']}** 쪽으로 발산합니다. "
+                   "좌우 형상 비대칭 또는 기울어진 축 정렬을 확인해 보세요.")
+    if stl_preview["stability"]["yaw"]["level"] == "danger":
+        st.warning(f"Yaw가 **{stl_preview['stability']['yaw']['direction']}** 쪽으로 발산합니다. "
+                   "수직꼬리 형상/축 정렬/CG 위치를 확인해 보세요.")
 elif stl_preview_error:
     st.warning(f"STL 적용 전 3D 진단을 만들지 못했습니다: `{stl_preview_error}`")
 
@@ -539,7 +576,9 @@ _anim_sim = sim_from_dict(sim_data["cur"])
 components.html(
     animation.realtime_animation_html(ac, env, _anim_init, _anim_sim,
                                       aero_model=sim_data.get("aero_model"),
-                                      stl_b64=stl_b64, align_fwd=stl_fwd, align_up=stl_up),
+                                      stl_b64=stl_b64 if stl_axis_ok else "",
+                                      align_fwd=stl_fwd, align_up=stl_up,
+                                      pre_rot=stl_pre_rot),
     height=640, scrolling=False)
 
 # ---------------------------------------------------------------------------

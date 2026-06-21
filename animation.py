@@ -80,11 +80,14 @@ def _build_dyn(ac, env, init, sim, aero_model) -> dict:
 
 def realtime_animation_html(ac, env, init, sim, aero_model=None,
                             stl_b64: str = "",
-                            align_fwd: str = "+X", align_up: str = "+Y") -> str:
+                            align_fwd: str = "+X", align_up: str = "+Y",
+                            pre_rot: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> str:
     """실시간 연속 3D 비행 애니메이션 HTML 생성."""
+    align = stl_analysis.align_matrix(align_fwd, align_up)
+    pre = stl_analysis.rotation_matrix_xyz(*pre_rot)
     data = {
         "vtail": int(ac.vtail.count),
-        "align": stl_analysis.align_matrix(align_fwd, align_up).tolist(),
+        "align": (pre @ align).tolist(),
         "pitch0": float(init.pitch0_deg),
         "roll0": float(init.roll0_deg),
         "yaw0": float(init.yaw0_deg),

@@ -449,11 +449,12 @@ def stl_diagnostic_figure(tris: np.ndarray, props: dict, cg_from_nose: float,
     span = max(float(mx[0] - mn[0]), float(mx[1] - mn[1]), float(mx[2] - mn[2]), 1e-6)
     axis_len = span * 0.28
     axis_defs = [
-        ("Roll 축", np.array([1.0, 0.0, 0.0]), stability["roll"][1]),
-        ("Pitch 축", np.array([0.0, 0.0, 1.0]), stability["pitch"][1]),
-        ("Yaw 축", np.array([0.0, 1.0, 0.0]), stability["yaw"][1]),
+        ("roll", "Roll 축", np.array([1.0, 0.0, 0.0])),
+        ("pitch", "Pitch 축", np.array([0.0, 0.0, 1.0])),
+        ("yaw", "Yaw 축", np.array([0.0, 1.0, 0.0])),
     ]
-    for label, direction, level in axis_defs:
+    for key, label, direction in axis_defs:
+        level = stability[key]["level"]
         p0 = cg - direction * axis_len
         p1 = cg + direction * axis_len
         fig.add_trace(go.Scatter3d(
@@ -461,6 +462,34 @@ def stl_diagnostic_figure(tris: np.ndarray, props: dict, cg_from_nose: float,
             mode="lines+text", text=["", label], textposition="top center",
             line=dict(color=LEVEL_COLOR.get(level, "#555"), width=7),
             name=label, hoverinfo="skip"))
+
+    moment_offsets = {
+        "roll": np.array([0.0, 0.18 * axis_len, 0.22 * axis_len]),
+        "pitch": np.array([0.18 * axis_len, 0.0, 0.0]),
+        "yaw": np.array([-0.18 * axis_len, 0.0, 0.22 * axis_len]),
+    }
+    for key, label, direction in axis_defs:
+        info = stability[key]
+        moment = float(info["moment"])
+        if abs(moment) < 1e-12:
+            continue
+        level = info["level"]
+        sign = 1.0 if moment >= 0.0 else -1.0
+        p0 = cg + moment_offsets[key]
+        p1 = p0 + direction * sign * axis_len * 0.65
+        arrow_label = ("발산" if level == "danger" else "모멘트")
+        text = f"{label} {arrow_label}: {info['direction']}"
+        color = LEVEL_COLOR.get(level, "#555")
+        fig.add_trace(go.Scatter3d(
+            x=[p0[0], p1[0]], y=[p0[2], p1[2]], z=[p0[1], p1[1]],
+            mode="lines+text", text=["", text], textposition="top center",
+            line=dict(color=color, width=9), name=text, hoverinfo="skip"))
+        fig.add_trace(go.Cone(
+            x=[p1[0]], y=[p1[2]], z=[p1[1]],
+            u=[direction[0] * sign], v=[direction[2] * sign], w=[direction[1] * sign],
+            sizemode="absolute", sizeref=axis_len * 0.16,
+            anchor="tip", colorscale=[[0, color], [1, color]],
+            showscale=False, name=text, hoverinfo="skip"))
 
     # 기수/바람/바운딩 중심선
     fig.add_trace(go.Scatter3d(

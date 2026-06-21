@@ -73,6 +73,26 @@ def align_matrix(fwd: str, up: str) -> np.ndarray:
     return np.vstack([f, u, r])           # 행이 f,u,r → R·f=e1 등
 
 
+def rotation_matrix_xyz(rx_deg: float = 0.0, ry_deg: float = 0.0,
+                        rz_deg: float = 0.0) -> np.ndarray:
+    """표준 기체프레임에서 X(roll)→Y(yaw)→Z(pitch) 순서 미세회전 행렬."""
+    rx, ry, rz = np.radians([rx_deg, ry_deg, rz_deg])
+    cx, sx = np.cos(rx), np.sin(rx)
+    cy, sy = np.cos(ry), np.sin(ry)
+    cz, sz = np.cos(rz), np.sin(rz)
+    Rx = np.array([[1, 0, 0], [0, cx, -sx], [0, sx, cx]])
+    Ry = np.array([[cy, 0, sy], [0, 1, 0], [-sy, 0, cy]])
+    Rz = np.array([[cz, -sz, 0], [sz, cz, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def rotate_mesh(tris: np.ndarray, rx_deg: float = 0.0, ry_deg: float = 0.0,
+                rz_deg: float = 0.0) -> np.ndarray:
+    """표준 기체프레임 메시를 적용 전 미세회전한 배열 반환."""
+    R = rotation_matrix_xyz(rx_deg, ry_deg, rz_deg)
+    return (tris.reshape(-1, 3) @ R.T).reshape(-1, 3, 3)
+
+
 # ---------------------------------------------------------------------------
 # 폴리헤드론 질량특성 (Eberly, density=1 → mass=volume)
 # ---------------------------------------------------------------------------
