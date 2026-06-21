@@ -19,6 +19,7 @@ import simulation
 import analysis
 import visualization as viz
 import animation
+import stl_analysis
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="항공기 비행 양상 시뮬레이터",
@@ -71,6 +72,11 @@ if st.session_state.get("_preset") != preset_name:
 
 if st.sidebar.button("↺ 이 타입의 기본값으로 초기화"):
     load_preset_into_state(preset_name)
+
+# STL 형상 분석값을 입력 위젯에 반영(위젯 생성 전에 적용)
+if st.session_state.pop("_apply_stl", False):
+    for k, v in st.session_state.get("_stl_props", {}).items():
+        st.session_state[k] = v
 
 st.sidebar.caption("프리셋은 실제 제조사 데이터가 아닌 **교육용 근사값**입니다.")
 
@@ -132,8 +138,15 @@ with st.sidebar.expander("🔧 관성 / 감쇠 / 시간 (심화)"):
     st.slider("시간 간격 dt (s)", 0.005, 0.1, step=0.005, key="dt")
 
 stl_b64 = ""
-with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드)"):
+stl_fwd, stl_up = "+X", "+Y"
+_UNIT = {"mm (밀리미터)": 0.001, "cm (센티미터)": 0.01, "m (미터)": 1.0}
+with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
     up = st.file_uploader("STL 파일 (.stl) 업로드", type=["stl"], key="stl_upload")
+    c_f, c_u = st.columns(2)
+    stl_fwd = c_f.selectbox("기수(앞) 축", stl_analysis.AXIS_NAMES, index=0, key="stl_fwd")
+    stl_up = c_u.selectbox("위(상단) 축", stl_analysis.AXIS_NAMES, index=2, key="stl_up")
+    unit_label = st.selectbox("STL 단위", list(_UNIT.keys()), index=0, key="stl_unit")
+
     if up is not None:
         raw = up.getvalue()
         mb = len(raw) / 1e6
@@ -142,11 +155,38 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드)"):
         st.caption(f"파일: {up.name} · {mb:.1f} MB")
         if mb > 6:
             st.warning("파일이 큽니다(>6MB). 렌더가 느릴 수 있어요. "
-                       "이진(binary) STL 또는 폴리곤 수를 줄인 모델을 권장합니다.")
-        st.caption("업로드 후 애니메이션의 **‘모델 조절’** 막대에서 크기·회전을 맞추세요. "
-                   "CAD(Z-up) 모델은 **‘Z-up 보정’** 버튼이 편합니다.")
+                       "이진(binary) STL / 폴리곤 수 줄인 모델 권장.")
+
+        if st.button("📐 STL 형상의 항공역학 특성 적용", width='stretch'):
+            try:
+                factor = _UNIT[unit_label]
+                tris = stl_analysis.parse_stl(raw) * factor
+                props = stl_analysis.analyze(tris, stl_fwd, stl_up,
+                                             float(st.session_state["mass"]))
+                keys = ["length", "span", "height", "S_wing", "wing_pos", "cp_base",
+                        "cg", "S_htail", "htail_arm", "S_vtail", "vtail_arm",
+                        "Ix", "Iy", "Iz"]
+                st.session_state["_stl_props"] = {k: float(props[k]) for k in keys}
+                st.session_state["_apply_stl"] = True
+                st.session_state["_stl_report"] = props
+                st.rerun()
+            except Exception as e:
+                st.error(f"STL 분석 실패: {e}")
+
+        rp = st.session_state.get("_stl_report")
+        if rp:
+            st.success(
+                f"추출됨(형상 기반 추정) · 삼각형 {rp['n_tri']:,}개\n\n"
+                f"- 길이 {rp['length']:.3g} m · 날개폭 {rp['span']:.3g} m · 높이 {rp['height']:.3g} m\n"
+                f"- 주날개 면적 {rp['S_wing']:.3g} m² · 수평꼬리 {rp['S_htail']:.2g} m²\n"
+                f"- CG {rp['cg']:.3g} m · CP {rp['cp_base']:.3g} m (기수 기준)\n"
+                f"- Ix {rp['Ix']:.2e} · Iy {rp['Iy']:.2e} · Iz {rp['Iz']:.2e} kg·m²")
+        st.caption("① 기수/위 축을 모델에 맞게 고르고 → ② **‘질량(kg)’** 을 먼저 입력한 뒤 → "
+                   "③ **‘적용’** 을 누르면 길이·면적·CG·CP·관성이 자동 반영됩니다. "
+                   "이후 **▶ 시뮬레이션 시작/재시작**.")
     else:
-        st.caption("업로드하지 않으면 기본 내장 항공기 모델을 사용합니다.")
+        st.caption("업로드하지 않으면 기본 내장 항공기 모델을 사용합니다. "
+                   "형상 분석을 쓰려면 모델의 기수/위 축을 고른 뒤 파일을 올리세요.")
 
 st.sidebar.markdown("---")
 auto = st.sidebar.checkbox("슬라이더 변경 시 자동 재계산", value=False, key="auto_run")
@@ -211,7 +251,8 @@ st.caption("**▶ 재생** 을 누르면 3D 항공기 모델이 실시간으로 
            "사이드바 **‘🛩️ 3D 모델 (STL 업로드)’** 에서 원하는 STL 을 올리면 그 모델로 바뀌고, "
            "아래 **‘모델 조절’** 막대에서 크기·회전을 맞출 수 있습니다.")
 components.html(
-    animation.realtime_animation_html(res, vtail_count=ac.vtail.count, stl_b64=stl_b64),
+    animation.realtime_animation_html(res, vtail_count=ac.vtail.count, stl_b64=stl_b64,
+                                      align_fwd=stl_fwd, align_up=stl_up),
     height=620, scrolling=False)
 
 # ---------------------------------------------------------------------------

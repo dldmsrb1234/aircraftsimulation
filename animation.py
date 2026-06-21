@@ -16,22 +16,26 @@ animation.py
 from __future__ import annotations
 import json
 from simulation import SimResult
+import stl_analysis
 
 
 def realtime_animation_html(res: SimResult, vtail_count: int = 1,
-                            stl_b64: str = "") -> str:
+                            stl_b64: str = "",
+                            align_fwd: str = "+X", align_up: str = "+Y") -> str:
     """pitch/roll/yaw 시계열(+선택적 STL)을 JS 로 넘겨 3D 애니메이션 HTML 생성."""
     t = res.t
     n = len(t)
     step = max(1, n // 1500)
     def arr(a):
         return [round(float(v), 3) for v in a[::step]]
+    align = stl_analysis.align_matrix(align_fwd, align_up).tolist()  # 모델→표준 회전
     data = {
         "pitch": arr(res.pitch), "roll": arr(res.roll), "yaw": arr(res.yaw),
         "aoa": arr(res.aoa), "t": arr(t),
         "pitch0": float(res.pitch0), "roll0": float(res.roll0), "yaw0": float(res.yaw0),
         "dt": float(t[1] - t[0]) * step,
         "vtail": int(vtail_count),
+        "align": align,
     }
     # STL 은 데이터가 클 수 있어 본문과 분리해 치환
     return (_TEMPLATE
@@ -59,10 +63,9 @@ _TEMPLATE = r"""
   <div id="ac_modelbar" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 8px;padding:6px 8px;background:#eef3f9;border-radius:8px;font-size:12px;">
     <b>모델 조절</b>
     <label>크기 <input id="ac_scale" type="range" min="0.2" max="4" step="0.05" value="1" style="vertical-align:middle;"><span id="ac_scaleval">1.00&times;</span></label>
-    <label>회전X <input id="ac_rx" type="range" min="-180" max="180" step="5" value="0"></label>
-    <label>회전Y <input id="ac_ry" type="range" min="-180" max="180" step="5" value="0"></label>
-    <label>회전Z <input id="ac_rz" type="range" min="-180" max="180" step="5" value="0"></label>
-    <button id="ac_zup"  style="padding:3px 8px;border:0;border-radius:6px;background:#cfe0f3;cursor:pointer;">Z-up 보정</button>
+    <label>미세회전X <input id="ac_rx" type="range" min="-180" max="180" step="5" value="0"></label>
+    <label>미세회전Y <input id="ac_ry" type="range" min="-180" max="180" step="5" value="0"></label>
+    <label>미세회전Z <input id="ac_rz" type="range" min="-180" max="180" step="5" value="0"></label>
     <button id="ac_reset" style="padding:3px 8px;border:0;border-radius:6px;background:#e2e8f0;cursor:pointer;">리셋</button>
   </div>
   <div id="ac_holder" style="position:relative;width:100%;height:460px;border-radius:10px;overflow:hidden;background:linear-gradient(#dfeaf6,#eef2f7);">
@@ -197,17 +200,26 @@ _TEMPLATE = r"""
   }
   setAttitude(ghost, DATA.pitch0, DATA.roll0, DATA.yaw0);
 
-  // --- 모델 크기/정렬 컨트롤 ---
+  // 축 정렬 쿼터니언(모델→표준) — 사이드바 축 선택과 동일
+  const A = DATA.align;
+  const mAlign = new THREE.Matrix4();
+  mAlign.set(A[0][0],A[0][1],A[0][2],0, A[1][0],A[1][1],A[1][2],0,
+             A[2][0],A[2][1],A[2][2],0, 0,0,0,1);
+  const qAlign = new THREE.Quaternion().setFromRotationMatrix(mAlign);
+
+  // --- 모델 크기/미세정렬 컨트롤 ---
   const elScale=document.getElementById('ac_scale'), elScaleV=document.getElementById('ac_scaleval');
   const elRx=document.getElementById('ac_rx'), elRy=document.getElementById('ac_ry'), elRz=document.getElementById('ac_rz');
+  const _fine=new THREE.Quaternion(), _qm=new THREE.Quaternion();
   function applyModelTransform(){
     const s = parseFloat(elScale.value) * baseFit;
-    const rx=parseFloat(elRx.value)*D2R, ry=parseFloat(elRy.value)*D2R, rz=parseFloat(elRz.value)*D2R;
-    for (const m of [planeModel, ghostModel]){ m.scale.setScalar(s); m.rotation.set(rx,ry,rz); }
+    _fine.setFromEuler(new THREE.Euler(parseFloat(elRx.value)*D2R,
+        parseFloat(elRy.value)*D2R, parseFloat(elRz.value)*D2R, 'XYZ'));
+    _qm.copy(qAlign).multiply(_fine);
+    for (const m of [planeModel, ghostModel]){ m.scale.setScalar(s); m.quaternion.copy(_qm); }
     elScaleV.innerHTML = parseFloat(elScale.value).toFixed(2)+'&times;';
   }
   [elScale, elRx, elRy, elRz].forEach(el => el.addEventListener('input', applyModelTransform));
-  document.getElementById('ac_zup').onclick = function(){ elRx.value=-90; applyModelTransform(); };
   document.getElementById('ac_reset').onclick = function(){ elScale.value=1; elRx.value=0; elRy.value=0; elRz.value=0; applyModelTransform(); };
   applyModelTransform();
 
