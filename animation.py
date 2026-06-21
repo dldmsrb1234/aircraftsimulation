@@ -4,8 +4,8 @@ animation.py
 ============
 브라우저에서 도는 **실시간 3D 비행 애니메이션** 컴포넌트 (Three.js).
 
-- 물리(회전 동역학)를 **브라우저에서 실시간으로 계속 적분**한다.
-  → 시간 제한(t_end) 없이 **정지 버튼을 누를 때까지 계속** 시뮬레이션.
+- 물리(회전 동역학)를 **브라우저에서 실시간으로 적분**한다.
+  → 설정된 시뮬레이션 시간(t_end)까지만 재생해 그래프 구간과 맞춘다.
 - 파이썬 시뮬레이션과 **동일한 모델·반암시적 적분식**을 JS 로 이식 → 그래프와 일치.
 - aero_model 이 있으면 STL 표면 패널 공력 표를, 없으면 매개변수 모델을 사용.
 - 마우스 드래그=시점 회전, 휠=확대. STL 업로드 시 모델·크기·정렬 조절.
@@ -69,7 +69,7 @@ def _build_dyn(ac, env, init, sim, aero_model) -> dict:
     n_sub = int(min(300, max(1, math.ceil(sim.dt * max(w_pitch, w_yaw, 1e-9) * scale_guard / 1.5))))
 
     return {
-        "mode": mode, "q": q, "dt": sim.dt, "n_sub": n_sub,
+        "mode": mode, "q": q, "dt": sim.dt, "t_end": sim.t_end, "n_sub": n_sub,
         "Ipitch": I_pitch, "Iroll": I_roll, "Iyaw": I_yaw,
         "cd_p": cd_p, "cd_r": cd_r, "cd_y": cd_y,
         "pitch0": init.pitch0_deg, "roll0": init.roll0_deg, "yaw0": init.yaw0_deg,
@@ -109,7 +109,7 @@ _TEMPLATE = r"""
       <input id="ac_speed_num" type="number" min="0.01" max="50" step="0.05" value="1" style="width:62px;padding:2px;border-radius:6px;border:1px solid #cbd5e1;">&times;
     </label>
     <label style="font-size:13px;"><input type="checkbox" id="ac_ghost" checked> 초기자세</label>
-    <span id="ac_hint" style="margin-left:auto;font-size:12px;color:#6b7785;">정지 전까지 연속 시뮬레이션 · 드래그=회전 · 휠=확대</span>
+    <span id="ac_hint" style="margin-left:auto;font-size:12px;color:#6b7785;">설정 시간까지 재생 · 드래그=회전 · 휠=확대</span>
   </div>
   <div id="ac_modelbar" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 8px;padding:6px 8px;background:#eef3f9;border-radius:8px;font-size:12px;">
     <b>모델 조절</b>
@@ -180,8 +180,9 @@ _TEMPLATE = r"""
     const fus=new THREE.Mesh(new THREE.CylinderGeometry(0.17,0.15,2.4,20),mb); fus.rotation.z=Math.PI/2; root.add(fus);
     const nose=new THREE.Mesh(new THREE.ConeGeometry(0.17,0.5,20),mb); nose.rotation.z=-Math.PI/2; nose.position.x=1.45; root.add(nose);
     const tail=new THREE.Mesh(new THREE.ConeGeometry(0.15,0.4,20),mb); tail.rotation.z=Math.PI/2; tail.position.x=-1.4; root.add(tail);
-    const wing=new THREE.Mesh(new THREE.BoxGeometry(0.55,0.04,3.0),mw); wing.position.set(0.05,0,0); wing.rotation.z=(DATA.wing_aoa||0)*D2R; root.add(wing);
-    const ht=new THREE.Mesh(new THREE.BoxGeometry(0.38,0.035,1.15),mw); ht.position.set(-1.25,0.02,0); ht.rotation.z=(DATA.htail_aoa||0)*D2R; root.add(ht);
+    const wingInc=((DYN.param&&DYN.param.wing_aoa)||0)*D2R, tailInc=((DYN.param&&DYN.param.htail_aoa)||0)*D2R;
+    const wing=new THREE.Mesh(new THREE.BoxGeometry(0.55,0.04,3.0),mw); wing.position.set(0.05,0,0); wing.rotation.z=wingInc; root.add(wing);
+    const ht=new THREE.Mesh(new THREE.BoxGeometry(0.38,0.035,1.15),mw); ht.position.set(-1.25,0.02,0); ht.rotation.z=tailInc; root.add(ht);
     function fin(z,c){ const f=new THREE.Mesh(new THREE.BoxGeometry(0.5,0.6,0.04),ma); f.position.set(-1.2,0.32,z); f.rotation.x=c; root.add(f); }
     if((DATA.vtail||1)>=2){fin(-0.45,0.20);fin(0.45,-0.20);} else {fin(0,0);}
     for(const z of [-0.95,0.95]){ const e=new THREE.Mesh(new THREE.CylinderGeometry(0.12,0.12,0.5,14),ma); e.rotation.z=Math.PI/2; e.position.set(0.18,-0.16,z); root.add(e); }
@@ -299,7 +300,10 @@ _TEMPLATE = r"""
             q:DYN.q0*D2R, p:DYN.p0*D2R, r:DYN.r0*D2R, T:0, aoa:0, lift:0};
   }
   function stepDt(){
-    const h=DYN.dt/DYN.n_sub;
+    const left=Math.max(0,DYN.t_end-st.T);
+    if(left<=1e-9){ st.T=DYN.t_end; playing=false; st.q=0; st.p=0; st.r=0; return; }
+    const dtStep=Math.min(DYN.dt,left);
+    const h=dtStep/DYN.n_sub;
     for(let s=0;s<DYN.n_sub;s++){
       const m=moments(st.th,st.ph,st.ps);
       const ss=(DYN.mode==='aero'?physScale:1), si=ss*ss, sc=Math.pow(ss,2.5);
@@ -312,7 +316,8 @@ _TEMPLATE = r"""
       st.th=Math.max(-CLP,Math.min(CLP,st.th)); st.ph=wrap(st.ph); st.ps=wrap(st.ps);
       st.aoa=m[3]; st.lift=m[4];
     }
-    st.T+=DYN.dt;
+    st.T+=dtStep;
+    if(st.T>=DYN.t_end-1e-9){ st.T=DYN.t_end; playing=false; st.q=0; st.p=0; st.r=0; }
   }
 
   // ===================== 재생 루프 =====================
@@ -343,7 +348,7 @@ _TEMPLATE = r"""
     renderer.render(scene,camera);
     requestAnimationFrame(frame);
   }
-  document.getElementById('ac_play').onclick =function(){ playing=true; lastTs=null; };
+  document.getElementById('ac_play').onclick =function(){ if(st.T>=DYN.t_end-1e-9){ st=initState(); accum=0; } playing=true; lastTs=null; };
   document.getElementById('ac_pause').onclick=function(){ playing=false; };
   document.getElementById('ac_stop').onclick =function(){ playing=false; st=initState(); };
   document.getElementById('ac_ghost').onchange=function(e){ ghost.visible=e.target.checked; };
