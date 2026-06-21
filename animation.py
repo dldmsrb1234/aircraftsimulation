@@ -114,9 +114,9 @@ _TEMPLATE = r"""
   <div id="ac_modelbar" style="display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:0 0 8px;padding:6px 8px;background:#eef3f9;border-radius:8px;font-size:12px;">
     <b>모델 조절</b>
     <label>크기 <input id="ac_scale" type="range" min="0.2" max="4" step="0.05" value="1" style="vertical-align:middle;"><span id="ac_scaleval">1.00&times;</span></label>
-    <label>미세회전X <input id="ac_rx" type="range" min="-180" max="180" step="5" value="0"></label>
-    <label>미세회전Y <input id="ac_ry" type="range" min="-180" max="180" step="5" value="0"></label>
-    <label>미세회전Z <input id="ac_rz" type="range" min="-180" max="180" step="5" value="0"></label>
+    <label>미세 Roll <input id="ac_rx" type="range" min="-180" max="180" step="5" value="0"></label>
+    <label>미세 Pitch <input id="ac_rz" type="range" min="-180" max="180" step="5" value="0"></label>
+    <label>미세 Yaw <input id="ac_ry" type="range" min="-180" max="180" step="5" value="0"></label>
     <button id="ac_reset" style="padding:3px 8px;border:0;border-radius:6px;background:#e2e8f0;cursor:pointer;">리셋</button>
   </div>
   <div id="ac_holder" style="position:relative;width:100%;height:460px;border-radius:10px;overflow:hidden;background:linear-gradient(#dfeaf6,#eef2f7);">
