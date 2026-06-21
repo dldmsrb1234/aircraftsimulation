@@ -1,0 +1,288 @@
+# -*- coding: utf-8 -*-
+"""
+app.py
+======
+항공기 모형 비행 양상 실시간 시각화 시뮬레이터 (Streamlit).
+
+실행:  streamlit run app.py
+"""
+
+from __future__ import annotations
+import copy
+import streamlit as st
+
+import presets
+from aircraft import (aircraft_from_dict, environment_from_dict,
+                      initial_from_dict, sim_from_dict)
+import simulation
+import analysis
+import visualization as viz
+import animation
+import streamlit.components.v1 as components
+
+st.set_page_config(page_title="항공기 비행 양상 시뮬레이터",
+                   page_icon="✈️", layout="wide")
+
+# 입력 key 목록 (프리셋 dict 에서 메타키 제외)
+_META = {"name", "_preset", "V_default_fast"}
+INPUT_KEYS = [k for k in presets.CUSTOM.keys() if k not in _META]
+
+LEVEL_COLOR = {"ok": "#2e7d32", "warn": "#ef6c00", "danger": "#c62828"}
+
+
+# ---------------------------------------------------------------------------
+# 헬퍼
+# ---------------------------------------------------------------------------
+def load_preset_into_state(name: str):
+    """프리셋 값을 session_state 의 위젯 key 로 주입."""
+    d = presets.get_preset(name)
+    for k, v in d.items():
+        if k not in _META:
+            st.session_state[k] = v
+    st.session_state["_preset"] = name
+
+
+def badge(text: str, level: str) -> str:
+    c = LEVEL_COLOR.get(level, "#555")
+    return (f"<span style='background:{c};color:#fff;padding:3px 10px;"
+            f"border-radius:12px;font-size:0.85em;white-space:nowrap'>{text}</span>")
+
+
+def compute(cur: dict):
+    ac = aircraft_from_dict(cur)
+    env = environment_from_dict(cur)
+    init = initial_from_dict(cur)
+    sim = sim_from_dict(cur)
+    res = simulation.run_simulation(ac, env, init, sim)
+    assess = analysis.overall_assessment(ac, env, res)
+    return {"ac": ac, "env": env, "res": res, "assess": assess, "cur": copy.deepcopy(cur)}
+
+
+# ---------------------------------------------------------------------------
+# 사이드바 — 입력
+# ---------------------------------------------------------------------------
+st.sidebar.title("✈️ 입력 패널")
+
+preset_name = st.sidebar.selectbox("1) 항공기 타입", presets.PRESET_NAMES,
+                                   key="preset_select")
+if st.session_state.get("_preset") != preset_name:
+    load_preset_into_state(preset_name)
+
+if st.sidebar.button("↺ 이 타입의 기본값으로 초기화"):
+    load_preset_into_state(preset_name)
+
+st.sidebar.caption("프리셋은 실제 제조사 데이터가 아닌 **교육용 근사값**입니다.")
+
+with st.sidebar.expander("🌬️ 환경 / 비행 조건", expanded=True):
+    st.slider("풍속 V (m/s)", 0.0, 200.0, step=1.0, key="V")
+    st.slider("공기밀도 ρ (kg/m³)", 0.5, 1.5, step=0.025, key="rho")
+
+with st.sidebar.expander("📐 기체 제원"):
+    st.number_input("전체 질량 mass (kg)", min_value=0.001, key="mass", format="%.3f")
+    st.number_input("기체 길이 length (m)", min_value=0.01, key="length", format="%.3f")
+    st.number_input("날개폭 span (m)", min_value=0.01, key="span", format="%.3f")
+    st.number_input("높이 height (m)", min_value=0.01, key="height", format="%.3f")
+
+with st.sidebar.expander("🛩️ 주날개"):
+    st.number_input("주날개 면적 S_wing (m²)", min_value=0.0001, key="S_wing", format="%.4f")
+    st.number_input("주날개 위치 (기수 기준, m)", key="wing_pos", format="%.3f")
+    st.slider("주날개 AoA (deg)", -5.0, 20.0, step=0.5, key="wing_aoa")
+    st.slider("양력기울기 CL_α (1/rad)", 3.0, 7.0, step=0.1, key="cl_alpha")
+    st.slider("실속각 (deg)", 5.0, 25.0, step=1.0, key="alpha_stall")
+    st.slider("최대 양력계수 CL_max", 0.8, 2.0, step=0.05, key="cl_max")
+    st.number_input("양력중심 CP 기준위치 (기수 기준, m)", key="cp_base", format="%.3f")
+    st.checkbox("AoA에 따른 CP 자동 이동", key="cp_auto")
+    st.slider("CP 이동 계수 k_cp (m/rad)", 0.0, 2.0, step=0.01, key="k_cp")
+
+with st.sidebar.expander("⚖️ 무게중심 / 좌우 비대칭"):
+    st.number_input("무게중심 CG (기수 기준, m)", key="cg", format="%.3f")
+    st.slider("좌우 비대칭 정도", -0.5, 0.5, step=0.01, key="asymmetry")
+
+with st.sidebar.expander("🪶 수평꼬리날개"):
+    st.number_input("수평꼬리 면적 S_htail (m²)", min_value=0.0, key="S_htail", format="%.4f")
+    st.slider("수평꼬리 AoA (deg)", -10.0, 10.0, step=0.5, key="htail_aoa")
+    st.number_input("수평꼬리 거리 (CG 기준, m)", min_value=0.0, key="htail_arm", format="%.3f")
+    st.number_input("수평꼬리 높이 (m)", key="htail_height", format="%.3f")
+    st.number_input("수평꼬리 CL_α (1/rad)", min_value=0.0, key="htail_cl_alpha", format="%.2f")
+
+with st.sidebar.expander("🪁 수직꼬리날개"):
+    st.number_input("수직꼬리 면적 S_vtail (m²)", min_value=0.0, key="S_vtail", format="%.4f")
+    st.number_input("수직꼬리 개수", min_value=0, max_value=4, step=1, key="vtail_count")
+    st.number_input("수직꼬리 거리 (CG 기준, m)", min_value=0.0, key="vtail_arm", format="%.3f")
+    st.number_input("수직꼬리 CL_α (1/rad)", min_value=0.0, key="vtail_cl_alpha", format="%.2f")
+
+with st.sidebar.expander("🎯 초기 자세 / 각속도"):
+    st.slider("초기 pitch (deg)", -30.0, 30.0, step=1.0, key="pitch0")
+    st.slider("초기 roll (deg)", -30.0, 30.0, step=1.0, key="roll0")
+    st.slider("초기 yaw (deg)", -30.0, 30.0, step=1.0, key="yaw0")
+    st.slider("초기 pitch 각속도 (deg/s)", -60.0, 60.0, step=1.0, key="q0")
+    st.slider("초기 roll 각속도 (deg/s)", -60.0, 60.0, step=1.0, key="p0")
+    st.slider("초기 yaw 각속도 (deg/s)", -60.0, 60.0, step=1.0, key="r0")
+
+with st.sidebar.expander("🔧 관성 / 감쇠 / 시간 (심화)"):
+    st.number_input("Ix (roll 관성)", min_value=0.0, key="Ix", format="%.4g")
+    st.number_input("Iy (pitch 관성)", min_value=0.0, key="Iy", format="%.4g")
+    st.number_input("Iz (yaw 관성)", min_value=0.0, key="Iz", format="%.4g")
+    st.number_input("pitch 감쇠 기준 cd_pitch", min_value=0.0, key="cd_pitch", format="%.4g")
+    st.number_input("roll 감쇠 기준 cd_roll", min_value=0.0, key="cd_roll", format="%.4g")
+    st.number_input("yaw 감쇠 기준 cd_yaw", min_value=0.0, key="cd_yaw", format="%.4g")
+    st.slider("회전 감쇠 배율", 0.0, 3.0, step=0.1, key="damping_mult")
+    st.slider("시뮬레이션 시간 (s)", 2.0, 60.0, step=1.0, key="t_end")
+    st.slider("시간 간격 dt (s)", 0.005, 0.1, step=0.005, key="dt")
+
+st.sidebar.markdown("---")
+auto = st.sidebar.checkbox("슬라이더 변경 시 자동 재계산", value=False, key="auto_run")
+run_clicked = st.sidebar.button("▶ 시뮬레이션 시작 / 재시작", type="primary",
+                                width='stretch')
+
+# 현재 입력 스냅샷
+cur = {k: st.session_state[k] for k in INPUT_KEYS}
+cur["name"] = preset_name
+
+# ---------------------------------------------------------------------------
+# 시뮬레이션 실행 결정
+# ---------------------------------------------------------------------------
+need = (st.session_state.get("sim") is None) or run_clicked or auto
+if need:
+    st.session_state["sim"] = compute(cur)
+
+sim_data = st.session_state["sim"]
+ac, env, res, assess = sim_data["ac"], sim_data["env"], sim_data["res"], sim_data["assess"]
+pending_changed = (not auto) and (sim_data["cur"] != {**cur})
+
+# ---------------------------------------------------------------------------
+# 메인 — 헤더 / 상태
+# ---------------------------------------------------------------------------
+st.title("✈️ 항공기 비행 양상 시뮬레이터")
+st.caption("받음각·무게중심·양력중심·꼬리날개 조건에 따른 pitch·roll·yaw 변화를 "
+           "근사 계산하여 보여주는 **교육용** 도구입니다. 실제 비행 성능 예측이 아닙니다.")
+
+if pending_changed:
+    st.info("입력값이 바뀌었습니다. 좌측 **▶ 시뮬레이션 시작/재시작** 을 눌러 반영하세요. "
+            "(현재 화면은 직전에 계산된 결과입니다.)")
+
+# 경고
+aoa_max = float(max(abs(res.aoa.min()), abs(res.aoa.max())))
+if aoa_max >= 18.0:
+    st.error(f"⚠️ 실속 위험: 최대 받음각 {aoa_max:.1f}° (18° 이상). "
+             "선형 양력 근사가 무너지고 양력이 급감하는 영역입니다.")
+elif aoa_max >= 12.0:
+    st.warning(f"주의: 최대 받음각 {aoa_max:.1f}° (12° 이상). 실속에 가까워지고 있습니다.")
+
+# 상태 배지
+c1, c2, c3, c4, c5, c6 = st.columns(6)
+for col, title, key in [(c1, "전체 안정성", "overall"), (c2, "AoA", "aoa"),
+                        (c3, "CP–CG", "cp_cg"), (c4, "Pitch", "pitch"),
+                        (c5, "Roll", "roll"), (c6, "Yaw", "yaw")]:
+    label, lvl = assess[key]
+    col.markdown(f"**{title}**<br>{badge(label, lvl)}", unsafe_allow_html=True)
+
+st.markdown("##### 🏗️ 제작 적합성 점수")
+sc = assess["score"]
+pcol1, pcol2 = st.columns([1, 4])
+pcol1.metric("점수", f"{sc} / 100")
+pcol2.progress(sc / 100.0)
+
+# ---------------------------------------------------------------------------
+# 🎬 실시간 3D 비행 애니메이션 (브라우저 WebGL/Three.js — 부드럽고 랙 없음)
+# ---------------------------------------------------------------------------
+st.markdown("### 🎬 실시간 3D 비행 애니메이션")
+st.caption("**▶ 재생** 을 누르면 3D 항공기 모델이 실시간으로 pitch·roll·yaw 자세를 보여줍니다. "
+           "**반투명=초기 자세, 진한 색=현재 자세**. **마우스 드래그=시점 회전, 휠=확대**. "
+           "**⏹ 정지** 를 누르기 전까지 ‘반복’이 켜져 있으면 계속 재생됩니다.")
+components.html(
+    animation.realtime_animation_html(res, vtail_count=ac.vtail.count),
+    height=560, scrolling=False)
+
+# ---------------------------------------------------------------------------
+# 시간 슬라이더 (아래 정적 그림/그래프 전용)
+# ---------------------------------------------------------------------------
+t_max = float(res.t[-1])
+spacing = float(res.t[1] - res.t[0])
+if "t_now" in st.session_state and st.session_state["t_now"] > t_max:
+    st.session_state["t_now"] = t_max
+st.markdown("##### 🔎 정적 분석용 시점 선택")
+t_now = st.slider("⏱️ 시각 t (s) — 아래 측면도/그래프를 이 시점으로 고정해서 자세히 봅니다",
+                  0.0, t_max, step=spacing, key="t_now")
+idx = res.index_at(t_now)
+
+# ---------------------------------------------------------------------------
+# 탭
+# ---------------------------------------------------------------------------
+tab_view, tab_graph, tab_ana, tab_in = st.tabs(
+    ["🛩️ 비행 자세", "📈 그래프", "🧪 분석 / 해석", "📋 입력 요약"])
+
+with tab_view:
+    st.caption(f"현재 표시 시점: t = {res.t[idx]:.2f}s (위 ‘정적 분석용 시점 선택’ 슬라이더로 변경)")
+    # 발표용 3D 자세(선택 시점 스냅샷)
+    st.plotly_chart(viz.attitude_3d_figure(ac, res, idx), width='stretch')
+
+    # 힘·모멘트 벡터가 필요한 분석용 단면도는 접어 둠(기본 닫힘)
+    with st.expander("📐 보조 단면도 (힘·모멘트 벡터 확인용 · 측면/정면/상면)"):
+        r1c1, r1c2 = st.columns(2)
+        r1c1.plotly_chart(viz.side_view_figure(ac, env, res, idx), width='stretch')
+        r1c2.plotly_chart(viz.front_view_figure(ac, env, res, idx), width='stretch')
+        st.plotly_chart(viz.top_view_figure(ac, env, res, idx), width='stretch')
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Pitch (deg)", f"{res.pitch[idx]:.1f}", f"초기 {res.pitch0:.1f}")
+    m2.metric("Roll (deg)", f"{res.roll[idx]:.1f}", f"초기 {res.roll0:.1f}")
+    m3.metric("Yaw (deg)", f"{res.yaw[idx]:.1f}", f"초기 {res.yaw0:.1f}")
+    m4.metric("AoA (deg)", f"{res.aoa[idx]:.1f}")
+
+with tab_graph:
+    g1, g2 = st.columns(2)
+    g1.plotly_chart(viz.time_series_figure(
+        res.t, [(res.pitch, "pitch", "#1f77b4"), (res.roll, "roll", "#2ca02c"),
+                (res.yaw, "yaw", "#d62728")],
+        "자세각 변화", "각도 (deg)", t_now), width='stretch')
+    g2.plotly_chart(viz.time_series_figure(
+        res.t, [(res.aoa, "AoA", "#9467bd")], "받음각(AoA)", "AoA (deg)", t_now),
+        width='stretch')
+    g3, g4 = st.columns(2)
+    g3.plotly_chart(viz.time_series_figure(
+        res.t, [(res.cp, "CP 위치", "#8c564b")], "양력중심(CP) 위치", "x_cp (m)", t_now),
+        width='stretch')
+    g4.plotly_chart(viz.time_series_figure(
+        res.t, [(res.L_wing, "주날개", "#2ca02c"), (res.L_tail, "꼬리날개", "#ff7f0e")],
+        "양력", "양력 (N)", t_now), width='stretch')
+    g5, g6 = st.columns(2)
+    g5.plotly_chart(viz.time_series_figure(
+        res.t, [(res.M_pitch, "M_pitch", "#1f77b4")], "Pitch 모멘트", "N·m", t_now),
+        width='stretch')
+    g6.plotly_chart(viz.time_series_figure(
+        res.t, [(res.M_roll, "M_roll", "#2ca02c"), (res.M_yaw, "M_yaw", "#d62728")],
+        "Roll / Yaw 모멘트", "N·m", t_now), width='stretch')
+
+with tab_ana:
+    st.subheader("🧭 상태 판정")
+    rows = [("전체 안정성", "overall"), ("AoA 상태", "aoa"), ("CP–CG 관계", "cp_cg"),
+            ("Pitch 경향", "pitch"), ("Roll 경향", "roll"), ("Yaw 경향", "yaw")]
+    for name, key in rows:
+        label, lvl = assess[key]
+        st.markdown(f"- **{name}**: {badge(label, lvl)}", unsafe_allow_html=True)
+
+    st.markdown(
+        f"- **세로 정적안정 k_θ** = {assess['k_theta']:.3g} N·m/rad "
+        f"({'양(+) → 안정' if assess['k_theta'] > 0 else '음(−) → 불안정'})")
+    st.markdown(
+        f"- **방향 안정 k_ψ** = {assess['k_psi']:.3g} N·m/rad "
+        f"({'양(+) → 안정' if assess['k_psi'] > 0 else '음(−) → 불안정'})")
+
+    st.subheader("📝 자동 해석 (과학탐구 보고서용)")
+    for s in analysis.interpretation_sentences(ac, env, res, assess):
+        st.markdown(f"- {s}")
+
+    st.subheader("⚠️ 모델의 한계")
+    st.markdown(
+        "- 선형 양력계수 근사는 **작은 받음각**에서만 잘 맞습니다.\n"
+        "- 양력중심 이동은 실제 익형 해석이 아니라 **단순 1차 근사**입니다.\n"
+        "- roll 에는 상반각(dihedral) 복원이 포함되지 않아 비대칭이 있으면 계속 구릅니다.\n"
+        "- 본 도구는 **설계 비교용**이며 실제 비행 성공을 보장하지 않습니다.")
+
+with tab_in:
+    st.subheader("📋 현재 적용된 입력값")
+    show = dict(sim_data["cur"])
+    st.json(show, expanded=False)
+    st.caption("이 값은 마지막으로 ‘시작/재시작’ 버튼을 눌렀을 때(또는 자동 재계산 시) "
+               "적용된 값입니다.")
