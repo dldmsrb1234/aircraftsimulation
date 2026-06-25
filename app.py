@@ -20,7 +20,6 @@ from aircraft import (aircraft_from_dict, environment_from_dict,
                       initial_from_dict, sim_from_dict)
 import simulation
 import analysis
-import physics
 import visualization as viz
 import animation
 import stl_analysis
@@ -36,12 +35,17 @@ INPUT_KEYS = [k for k in presets.CUSTOM.keys() if k not in _META]
 
 LEVEL_COLOR = {"ok": "#2e7d32", "warn": "#ef6c00", "danger": "#c62828"}
 STL_QUALITY = {
-    "빠름": dict(n_alpha=27, n_beta=11, max_tris=30000, occlusion=False, shadow_bins=0),
-    "기본": dict(n_alpha=41, n_beta=17, max_tris=60000, occlusion=True, shadow_bins=80),
-    "정밀": dict(n_alpha=61, n_beta=25, max_tris=100000, occlusion=True, shadow_bins=120),
+    "빠름": dict(n_alpha=27, n_beta=11, max_tris=30000, occlusion=True, shadow_bins=40,
+               wake_decay=1.4, bernoulli_strength=0.30, vortex_efficiency=0.85),
+    "기본": dict(n_alpha=41, n_beta=17, max_tris=60000, occlusion=True, shadow_bins=80,
+               wake_decay=1.6, bernoulli_strength=0.34, vortex_efficiency=0.82),
+    "정밀": dict(n_alpha=61, n_beta=25, max_tris=100000, occlusion=True, shadow_bins=120,
+               wake_decay=1.8, bernoulli_strength=0.36, vortex_efficiency=0.80),
 }
 STL_PREVIEW_QUALITY = dict(n_alpha=21, n_beta=9, max_tris=18000,
-                           occlusion=True, shadow_bins=50)
+                           occlusion=True, shadow_bins=50,
+                           wake_decay=1.6, bernoulli_strength=0.34,
+                           vortex_efficiency=0.82)
 DEFAULT_STL_FWD = "+X"
 DEFAULT_STL_UP = "+Z"   # most CAD/STL aircraft exports are Z-up; app frame is Y-up
 
@@ -158,7 +162,7 @@ def make_stl_preview(raw: bytes, unit_factor: float, mass: float,
         rotated, np.asarray(props["cm"]), **STL_PREVIEW_QUALITY)
     model["cg_y"] = float(props["cm"][1]) + float(cg_y_offset)
     model["cg_z"] = float(props["cm"][2]) + float(cg_z_offset)
-    q_dyn = physics.dynamic_pressure(float(cur_values["rho"]), float(cur_values["V"]))
+    q_dyn = 0.5 * float(cur_values["rho"]) * float(cur_values["V"]) ** 2
     cgp = panel_aero.cg_point_from_nose(model, cg_from_nose)
     k_pitch = panel_aero.pitch_stiffness(model, q_dyn, cgp)
     k_roll = panel_aero.roll_stiffness(model, q_dyn, cgp)
@@ -168,6 +172,8 @@ def make_stl_preview(raw: bytes, unit_factor: float, mass: float,
         math.radians(float(cur_values["roll0"])),
         math.radians(float(cur_values["yaw0"])))
     F, M, alpha, beta = panel_aero.aero(model, w, q_dyn, cgp)
+    hit_area = panel_aero.ray_hit_area(model, w)
+    wake_distance = panel_aero.ray_wake_distance(model, w)
     m_roll, m_pitch, m_yaw = panel_aero.body_moments(M)
     ref = max(q_dyn * float(model["ref_area"]) * max(float(props["length"]), 1e-6), 1e-6)
     tol = ref * 1e-4
@@ -194,13 +200,17 @@ def make_stl_preview(raw: bytes, unit_factor: float, mass: float,
         "cg_y_applied": model["cg_y"], "cg_z_applied": model["cg_z"],
         "Ix": Ix, "Iy": Iy, "Iz": Iz, "alpha_preview": math.degrees(float(alpha)),
         "beta_preview": math.degrees(float(beta)), "L_preview": float(F[1]),
-        "D_preview": float(-F[0]), "n_tri_preview": int(model["n_tri"]),
+        "D_preview": float(-F[0]), "ray_area_preview": float(hit_area),
+        "wake_distance_preview": float(wake_distance),
+        "n_tri_preview": int(model["n_tri"]),
     })
     return {"tris": rotated, "props": props, "cg": cg_from_nose,
             "stability": stability}
 
 
 def compute(cur: dict, aero_model=None):
+    if aero_model is None:
+        raise ValueError("ray-only simulation requires an applied STL aero_model")
     ac = aircraft_from_dict(cur)
     env = environment_from_dict(cur)
     init = initial_from_dict(cur)
@@ -210,16 +220,16 @@ def compute(cur: dict, aero_model=None):
     if aero_model is not None:
         try:
             res = simulation.run_simulation(ac, env, init, sim, aero_model=aero_model)
-        except Exception as e:           # 패널 공력 실패 시 매개변수 모델로 안전 대체
-            aero_err = f"{type(e).__name__}: {e}"
+        except Exception as e:
+            raise RuntimeError(f"STL ray simulation failed: {type(e).__name__}: {e}") from e
     if res is None:
-        res = simulation.run_simulation(ac, env, init, sim, aero_model=None)
-    used_aero = (aero_model is not None and aero_err is None)
+        raise ValueError("ray-only simulation requires an applied STL aero_model")
+    used_aero = True
     k_theta_override = None
     k_psi_override = None
     if used_aero:
         try:
-            q_dyn = physics.dynamic_pressure(env.rho, env.V)
+            q_dyn = 0.5 * env.rho * env.V * env.V
             cgp = panel_aero.cg_point_from_nose(aero_model, ac.cg)
             k_theta_override = panel_aero.pitch_stiffness(aero_model, q_dyn, cgp)
             k_psi_override = panel_aero.yaw_stiffness(aero_model, q_dyn, cgp)
@@ -307,7 +317,7 @@ with st.sidebar.expander("🔧 관성 / 감쇠 / 시간 (심화)"):
     st.number_input("roll 감쇠 기준 cd_roll", min_value=0.0, key="cd_roll", format="%.4g")
     st.number_input("yaw 감쇠 기준 cd_yaw", min_value=0.0, key="cd_yaw", format="%.4g")
     st.slider("회전 감쇠 배율", 0.0, 3.0, step=0.1, key="damping_mult")
-    st.slider("시뮬레이션 시간 (s)", 2.0, 60.0, step=1.0, key="t_end")
+    st.slider("그래프 기록 시간 (s)", 2.0, 60.0, step=1.0, key="t_end")
     st.slider("시간 간격 dt (s)", 0.005, 0.1, step=0.005, key="dt")
 
 stl_b64 = ""
@@ -441,6 +451,10 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 props["static_margin"] = geo["cp_base"] - geo["cg"]
                 props["physics_scale"] = float(stl_physics_scale)
                 props["quality"] = stl_quality
+                props["wake_decay"] = float(aero_model.get("wake_decay", 0.0))
+                props["bernoulli_strength"] = float(aero_model.get("bernoulli_strength", 0.0))
+                props["vortex_efficiency"] = float(aero_model.get("vortex_efficiency", 0.0))
+                props["aspect_ratio_panel"] = float(aero_model.get("aspect_ratio", 0.0))
                 props["pre_rot"] = [float(v) for v in stl_pre_rot]
                 st.session_state["_aero_model"] = aero_model
                 st.session_state["_aero_signature"] = stl_sig_current
@@ -468,6 +482,8 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 f"- 물리 크기 배율 {rp.get('physics_scale', 1.0):.2f}×\n"
                 f"- 초기 방향 Roll/Pitch/Yaw = {rp.get('pre_rot', [0, 0, 0])[0]:.0f}° / "
                 f"{rp.get('pre_rot', [0, 0, 0])[2]:.0f}° / {rp.get('pre_rot', [0, 0, 0])[1]:.0f}°\n"
+                f"- ray wake={rp.get('wake_decay', 0):.2g} · Bernoulli={rp.get('bernoulli_strength', 0):.2g} · "
+                f"vortex e={rp.get('vortex_efficiency', 0):.2g} · AR≈{rp.get('aspect_ratio_panel', 0):.2g}\n"
                 f"- Ix {rp['Ix']:.2e} · Iy {rp['Iy']:.2e} · Iz {rp['Iz']:.2e} kg·m²\n"
                 f"- 표면 패널 공력 적용(세로강성 k_θ={rp.get('k_theta_panel', 0):.2f}, "
                 f"방향강성 k_ψ={rp.get('k_psi_panel', 0):.2f})")
@@ -482,8 +498,8 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                    "② **‘적용’** 을 누르면 길이·면적·CG·CP·관성·ray 공력표가 함께 반영됩니다. "
                    "이후 **▶ 시뮬레이션 시작/재시작**.")
     else:
-        st.caption("업로드하지 않으면 기본 내장 항공기 모델을 사용합니다. "
-                   "형상 분석을 쓰려면 모델의 기수/위 축을 고른 뒤 파일을 올리세요.")
+        st.caption("ray-only 엔진은 STL 적용 후에만 시뮬레이션합니다. "
+                   "파일을 올리고 단위·질량·방향·CG를 정한 뒤 적용하세요.")
 
 st.sidebar.markdown("---")
 auto = st.sidebar.checkbox("슬라이더 변경 시 자동 재계산", value=False, key="auto_run")
@@ -509,13 +525,13 @@ stl_settings_pending = (
     and st.session_state.get("_aero_signature") != stl_sig_current
 )
 aero_model = st.session_state.get("_aero_model") if aero_ready else None
-need = (st.session_state.get("sim") is None) or run_clicked or auto or stl_settings_pending
+if not aero_ready:
+    st.session_state["sim"] = None
+need = aero_ready and ((st.session_state.get("sim") is None) or run_clicked or auto)
 if need:
     st.session_state["sim"] = compute(cur, aero_model)
 
-sim_data = st.session_state["sim"]
-ac, env, res, assess = sim_data["ac"], sim_data["env"], sim_data["res"], sim_data["assess"]
-pending_changed = (not auto) and (sim_data["cur"] != {**cur})
+sim_data = st.session_state.get("sim")
 
 # ---------------------------------------------------------------------------
 # 메인 — 헤더 / 상태
@@ -523,6 +539,42 @@ pending_changed = (not auto) and (sim_data["cur"] != {**cur})
 st.title("✈️ 항공기 비행 양상 시뮬레이터")
 st.caption("받음각·무게중심·양력중심·꼬리날개 조건에 따른 pitch·roll·yaw 변화를 "
            "근사 계산하여 보여주는 **교육용** 도구입니다. 실제 비행 성능 예측이 아닙니다.")
+
+if sim_data is None:
+    if stl_settings_pending:
+        st.info("STL settings changed. Apply the STL again to rebuild the ray table.")
+    elif stl_b64:
+        st.warning("STL is loaded, but the ray-only physics engine is waiting for Apply.")
+    else:
+        st.warning("The old parameter physics engine has been removed. Upload and apply an STL to start ray-based simulation.")
+
+    if stl_preview is not None:
+        pp = stl_preview["props"]
+        st.markdown("### STL ray preview before apply")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("CG / CP", f"{pp['cg_applied']:.3g} / {pp['cp_base']:.3g} m",
+                  f"CP-CG {pp['cp_base'] - pp['cg_applied']:+.3g} m")
+        d2.metric("Preview AoA", f"{pp['alpha_preview']:.1f} deg",
+                  f"beta {pp['beta_preview']:.1f} deg")
+        d3.metric("Ray force", f"{pp['L_preview']:.3g} N",
+                  f"Drag {pp['D_preview']:.3g} N")
+        d4.metric("Ray area", f"{pp['ray_area_preview']:.3g} m²",
+                  f"wake {pp['wake_distance_preview']:.3g} m")
+        s1, s2, s3 = st.columns(3)
+        for col, name, key in ((s1, "Pitch", "pitch"), (s2, "Roll", "roll"), (s3, "Yaw", "yaw")):
+            info = stl_preview["stability"][key]
+            col.markdown(f"**{name}**<br>{badge(info['label'], info['level'])}", unsafe_allow_html=True)
+            col.caption(f"{info['direction']} | k={info['k']:.3g} N*m/rad | M={info['moment']:.3g} N*m")
+        st.plotly_chart(
+            viz.stl_diagnostic_figure(
+                stl_preview["tris"], pp, pp["cg_applied"], stl_preview["stability"]),
+            width='stretch', key=stl_preview_key)
+    elif stl_preview_error:
+        st.warning(f"STL preview failed: `{stl_preview_error}`")
+    st.stop()
+
+ac, env, res, assess = sim_data["ac"], sim_data["env"], sim_data["res"], sim_data["assess"]
+pending_changed = (not auto) and (sim_data["cur"] != {**cur})
 
 if pending_changed:
     st.info("입력값이 바뀌었습니다. 좌측 **▶ 시뮬레이션 시작/재시작** 을 눌러 반영하세요. "
@@ -533,7 +585,7 @@ if stl_settings_pending:
             "사이드바에서 **STL 형상의 항공역학 특성 적용** 을 다시 누르면 새 설정으로 계산합니다.")
 
 if sim_data.get("aero_err"):
-    st.error("⚠️ STL 표면 패널 공력 계산 중 오류가 발생해 매개변수 모델로 대체했습니다. "
+    st.error("⚠️ STL ray 물리 계산 중 오류가 발생해 시뮬레이션을 중단했습니다. "
              f"원인: `{sim_data['aero_err']}` — 이 메시지를 알려주시면 정확히 고치겠습니다.")
 
 # 경고
@@ -575,8 +627,8 @@ if stl_preview is not None:
               f"β {pp['beta_preview']:.1f}°")
     d3.metric("미리보기 양력", f"{pp['L_preview']:.3g} N",
               f"Drag {pp['D_preview']:.3g} N")
-    d4.metric("ray 패널", f"{pp['n_tri_preview']:,}개",
-              f"원본 {pp['n_tri']:,}개")
+    d4.metric("ray 충돌 면적", f"{pp['ray_area_preview']:.3g} m²",
+              f"wake {pp['wake_distance_preview']:.3g} m")
 
     s1, s2, s3 = st.columns(3)
     for col, name, key in [(s1, "Pitch 발산 여부", "pitch"),
@@ -609,11 +661,9 @@ elif stl_preview_error:
 # 🎬 실시간 3D 비행 애니메이션 (브라우저 WebGL/Three.js — 부드럽고 랙 없음)
 # ---------------------------------------------------------------------------
 st.markdown("### 🎬 실시간 3D 비행 애니메이션")
-st.caption("**▶ 재생** 을 누르면 3D 항공기가 사이드바의 **시뮬레이션 시간**까지만 "
-           "pitch·roll·yaw 자세를 시뮬레이션합니다(브라우저에서 실시간 적분). "
-           "**반투명=초기 자세, 진한 색=현재 자세**. **마우스 드래그=시점 회전, 휠=확대**. "
-           "사이드바 **‘🛩️ 3D 모델 (STL 업로드)’** 로 모델을 바꾸고 **‘모델 조절’** 로 크기·회전을 맞춥니다. "
-           "(아래 그래프·분석과 같은 시간 구간 기준입니다)")
+st.caption("3D 애니메이션은 STL ray 물리 테이블로 브라우저에서 계속 적분되며, Pause/Stop을 누를 때까지 시간 제한 없이 재생됩니다. "
+           "사이드바의 그래프 기록 시간은 아래 정적 그래프·분석 배열 길이에만 적용됩니다. "
+           "모델 조절의 scale/회전은 STL 표시와 ray 기반 힘·모멘트 계산에 즉시 반영됩니다.")
 _anim_init = initial_from_dict(sim_data["cur"])
 _anim_sim = sim_from_dict(sim_data["cur"])
 components.html(
@@ -654,11 +704,13 @@ with tab_view:
         r1c2.plotly_chart(viz.front_view_figure(ac, env, res, idx), width='stretch')
         st.plotly_chart(viz.top_view_figure(ac, env, res, idx), width='stretch')
 
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("Pitch (deg)", f"{res.pitch[idx]:.1f}", f"초기 {res.pitch0:.1f}")
     m2.metric("Roll (deg)", f"{res.roll[idx]:.1f}", f"초기 {res.roll0:.1f}")
     m3.metric("Yaw (deg)", f"{res.yaw[idx]:.1f}", f"초기 {res.yaw0:.1f}")
     m4.metric("AoA (deg)", f"{res.aoa[idx]:.1f}")
+    m5.metric("Ray area", f"{res.ray_area[idx]:.3g} m²")
+    m6.metric("Wake dist.", f"{res.ray_wake_distance[idx]:.3g} m")
 
 with tab_graph:
     g1, g2 = st.columns(2)
@@ -690,6 +742,13 @@ with tab_graph:
     g6.plotly_chart(viz.time_series_figure(
         res.t, [(res.M_roll, "M_roll", "#2ca02c"), (res.M_yaw, "M_yaw", "#d62728")],
         "Roll / Yaw 모멘트", "N·m", t_now), width='stretch')
+    g7, g8 = st.columns(2)
+    g7.plotly_chart(viz.time_series_figure(
+        res.t, [(res.ray_area, "ray hit area", "#17becf")],
+        "Ray 충돌 가능 면적", "m²", t_now), width='stretch')
+    g8.plotly_chart(viz.time_series_figure(
+        res.t, [(res.ray_wake_distance, "wake distance", "#7f7f7f")],
+        "Ray 충돌 후 wake 거리", "m", t_now), width='stretch')
 
 with tab_ana:
     st.subheader("🧭 상태 판정")
@@ -712,9 +771,9 @@ with tab_ana:
 
     st.subheader("⚠️ 모델의 한계")
     st.markdown(
-        "- 선형 양력계수 근사는 **작은 받음각**에서만 잘 맞습니다.\n"
-        "- 양력중심 이동은 실제 익형 해석이 아니라 **단순 1차 근사**입니다.\n"
-        "- roll 에는 상반각(dihedral) 복원이 포함되지 않아 비대칭이 있으면 계속 구릅니다.\n"
+        "- 현재 물리는 STL ray/panel 기반의 비점성 근사입니다.\n"
+        "- Bernoulli 흡입, ray wake 거리 감쇠, trailing-vortex 유도항을 포함하지만 실제 CFD/풍동 해석은 아닙니다.\n"
+        "- occlusion은 투영 격자 기반 1차 ray 근사라 오목 형상과 복잡한 후류는 오차가 날 수 있습니다.\n"
         "- 본 도구는 **설계 비교용**이며 실제 비행 성공을 보장하지 않습니다.")
 
 with tab_in:

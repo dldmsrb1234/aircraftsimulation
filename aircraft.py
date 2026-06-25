@@ -98,7 +98,7 @@ class InitialState:
 
 @dataclass
 class SimConfig:
-    t_end: float         # 시뮬레이션 시간 [s]
+    t_end: float         # 그래프 기록 시간 [s]
     dt: float            # 시간 간격 [s]
     damping_mult: float  # 감쇠 배율(사용자 조절용 단일 노브)
 

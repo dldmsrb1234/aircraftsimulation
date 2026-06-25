@@ -30,6 +30,9 @@ import numpy as np
 CW = 2.9         # windward(양압) 기울기
 CL_SUC = 0.75    # leeward(흡입) 기울기
 CD_SKIN = 0.018  # 표면 마찰/형상 drag 보정(동압 q 당)
+BERNOULLI_SUCTION = 0.34
+VORTEX_EFFICIENCY = 0.82
+WAKE_DECAY = 1.6
 
 
 def _ensure_outward(tris: np.ndarray) -> np.ndarray:
@@ -39,18 +42,20 @@ def _ensure_outward(tris: np.ndarray) -> np.ndarray:
     if sv < 0:
         tris = tris[:, [0, 2, 1], :].copy()
 
-    # 전체 와인딩이 맞아도 일부 부품/패널만 뒤집힌 STL이 흔하다.
-    # 패널 중심이 형상 중심에서 뻗어나가는 방향과 법선이 크게 반대면 개별 보정한다.
-    v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
-    cen = (v0 + v1 + v2) / 3.0
-    nrm = np.cross(v1 - v0, v2 - v0)
-    center = tris.reshape(-1, 3).mean(0)
-    radial = cen - center
-    nr = np.linalg.norm(nrm, axis=1)
-    rr = np.linalg.norm(radial, axis=1)
-    flip = np.einsum("ij,ij->i", nrm, radial) < -1e-6 * np.maximum(nr * rr, 1.0)
-    if np.any(flip):
-        tris[flip] = tris[flip][:, [0, 2, 1], :]
+    # 부피가 거의 0인 열린 STL은 전체 signed volume으로 방향을 정하기 어렵다.
+    # 이때만 radial fallback을 쓰고, 닫힌/다중 부품 STL에서는 정상 뒷면을
+    # 앞면처럼 뒤집지 않도록 개별 패널 보정을 피한다.
+    if abs(float(sv)) < 1e-12:
+        v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+        cen = (v0 + v1 + v2) / 3.0
+        nrm = np.cross(v1 - v0, v2 - v0)
+        center = tris.reshape(-1, 3).mean(0)
+        radial = cen - center
+        nr = np.linalg.norm(nrm, axis=1)
+        rr = np.linalg.norm(radial, axis=1)
+        flip = np.einsum("ij,ij->i", nrm, radial) < -1e-6 * np.maximum(nr * rr, 1.0)
+        if np.any(flip):
+            tris[flip] = tris[flip][:, [0, 2, 1], :]
     return tris
 
 
@@ -73,7 +78,7 @@ def _dir(al, be):
     return d / np.linalg.norm(d)
 
 
-def _pressure_cp(m: np.ndarray) -> np.ndarray:
+def _pressure_cp(m: np.ndarray, bernoulli_strength: float = BERNOULLI_SUCTION) -> np.ndarray:
     """패널 입사계수 m=-(n·d)를 압력계수로 변환.
 
     작은 각도에서는 거의 선형으로 반응하고, 큰 각도에서는 impact 항이 더 강해지게
@@ -81,7 +86,15 @@ def _pressure_cp(m: np.ndarray) -> np.ndarray:
     """
     a = np.abs(m)
     shape = m * (0.42 + 0.58 * a)
-    return np.where(m >= 0.0, CW * shape, CL_SUC * shape)
+    impact = np.where(m >= 0.0, CW * shape, CL_SUC * shape)
+
+    # Bernoulli suction surrogate: leeward panels accelerate tangential flow,
+    # lowering static pressure.  This is intentionally a compact educational
+    # approximation, not a replacement for viscous CFD or airfoil polars.
+    leeward = np.maximum(-m, 0.0)
+    tangent = np.sqrt(np.clip(1.0 - a * a, 0.0, 1.0))
+    bernoulli = -float(bernoulli_strength) * leeward * (0.35 + 0.65 * tangent)
+    return impact + bernoulli
 
 
 def _perp_basis(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -96,21 +109,22 @@ def _perp_basis(d: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return u, v
 
 
-def _visible_mask(cen: np.ndarray, area: np.ndarray, d: np.ndarray,
-                  bins: int = 80) -> np.ndarray:
-    """기류 방향에서 보이는 앞쪽 패널 근사.
+def _ray_exposure(cen: np.ndarray, area: np.ndarray, d: np.ndarray,
+                  bins: int = 80,
+                  wake_decay: float = WAKE_DECAY) -> tuple[np.ndarray, np.ndarray]:
+    """기류 방향 ray 충돌 노출도와 첫 충돌면 뒤쪽 거리.
 
     삼각형 중심을 기류 수직 평면에 투영한 뒤 같은 셀 안에서 가장 앞쪽
-    depth 를 가진 패널을 ray 가 먼저 만나는 면으로 본다. 완전한 BVH ray trace는
-    아니지만, 동체 내부/뒤쪽 windward 면이 중복으로 힘을 만드는 문제를 줄인다.
+    depth 를 가진 패널을 ray 가 먼저 만나는 면으로 본다. 첫 충돌면은 노출도 1,
+    그 뒤쪽 면은 첫 충돌면과의 거리(depth lag)에 따라 wake 감쇠를 받는다.
     """
     if bins <= 0 or len(cen) == 0:
-        return np.ones(len(cen), dtype=bool)
+        return np.ones(len(cen), dtype=float), np.zeros(len(cen), dtype=float)
     u, v = _perp_basis(d)
     pu, pv = cen @ u, cen @ v
     du, dv = float(pu.max() - pu.min()), float(pv.max() - pv.min())
     if du < 1e-12 or dv < 1e-12:
-        return np.ones(len(cen), dtype=bool)
+        return np.ones(len(cen), dtype=float), np.zeros(len(cen), dtype=float)
 
     bu = np.clip(((pu - pu.min()) / du * bins).astype(int), 0, bins - 1)
     bv = np.clip(((pv - pv.min()) / dv * bins).astype(int), 0, bins - 1)
@@ -121,8 +135,18 @@ def _visible_mask(cen: np.ndarray, area: np.ndarray, d: np.ndarray,
 
     cell = max(du, dv) / bins
     tri = float(np.sqrt(max(float(np.mean(area)), 1e-16)))
-    tol = max(cell * 0.65, tri * 0.75, 1e-8)
-    return depth <= nearest[key] + tol
+    tol = max(cell * 0.65, 1e-8)
+    lag = np.maximum(depth - nearest[key], 0.0)
+    wake_len = max(cell * float(wake_decay), tri * 0.08 * float(wake_decay), 1e-8)
+    exposure = np.where(lag <= tol, 1.0, np.exp(-(lag - tol) / wake_len))
+    return np.clip(exposure, 0.0, 1.0), lag
+
+
+def _visible_mask(cen: np.ndarray, area: np.ndarray, d: np.ndarray,
+                  bins: int = 80) -> np.ndarray:
+    """기류 방향에서 직접 보이는 앞쪽 패널 근사."""
+    exposure, _ = _ray_exposure(cen, area, d, bins)
+    return exposure > 0.5
 
 
 def _reference_area(nhat: np.ndarray, area: np.ndarray) -> float:
@@ -171,7 +195,10 @@ def build_aero_model(tris: np.ndarray, cm: np.ndarray,
                      a_max: float = 89.0, b_max: float = 89.0,
                      max_tris: int = 60000,
                      occlusion: bool = True,
-                     shadow_bins: int = 80) -> dict:
+                     shadow_bins: int = 80,
+                     wake_decay: float = WAKE_DECAY,
+                     bernoulli_strength: float = BERNOULLI_SUCTION,
+                     vortex_efficiency: float = VORTEX_EFFICIENCY) -> dict:
     """패널 공력 표 생성. 모멘트는 **원점 기준**(Fg, Mg 모두 동압 q 당)으로 저장하여
     실행 시 임의의 무게중심에 대해 M_cg = M_origin − cg×F 로 옮길 수 있게 한다.
 
@@ -184,30 +211,67 @@ def build_aero_model(tris: np.ndarray, cm: np.ndarray,
     betas = np.radians(np.linspace(-b_max, b_max, n_beta))
     Fg = np.zeros((n_alpha, n_beta, 3))
     Mg = np.zeros((n_alpha, n_beta, 3))
+    Ag = np.zeros((n_alpha, n_beta))
+    Dg = np.zeros((n_alpha, n_beta))
+
+    dims = np.ptp(tris.reshape(-1, 3), axis=0)
+    span_ref = max(float(dims[2]), float(dims[1]), math.sqrt(max(float(meta["ref_area"]), 1e-12)))
+    aspect_ratio = max(span_ref * span_ref / max(float(meta["ref_area"]), 1e-12), 0.25)
+    cm_arr = np.asarray(cm, dtype=float)
 
     for i, al in enumerate(alphas):
         for j, be in enumerate(betas):
             d = _dir(al, be)
             m = -(nhat @ d)                         # >0 windward
-            Cp = _pressure_cp(m)
+            Cp = _pressure_cp(m, bernoulli_strength)
             if occlusion:
-                visible = _visible_mask(cen, geom_area, d, shadow_bins)
-                Cp = np.where(visible, Cp, 0.0)
+                exposure, lag = _ray_exposure(cen, geom_area, d, shadow_bins, wake_decay)
             else:
-                visible = np.ones(len(eff_area), dtype=bool)
-            f = (-(Cp * eff_area))[:, None] * nhat      # q 당 패널 힘
-            f += (CD_SKIN * eff_area * visible)[:, None] * d
-            Fg[i, j] = f.sum(0)
-            Mg[i, j] = np.cross(cen, f).sum(0)      # 원점 기준 모멘트
+                exposure = np.ones(len(eff_area), dtype=float)
+                lag = np.zeros(len(eff_area), dtype=float)
+            f = (-(Cp * eff_area * exposure))[:, None] * nhat      # q 당 패널 힘
+            f += (CD_SKIN * eff_area * exposure)[:, None] * d
+            F = f.sum(0)
+            M = np.cross(cen, f).sum(0)      # 원점 기준 모멘트
+
+            # Trailing-vortex induced drag surrogate.  Lift-like force
+            # perpendicular to the local flow generates induced drag along the
+            # flow direction; the effective hit center gives it a moment arm.
+            if vortex_efficiency > 1e-9 and meta["ref_area"] > 1e-12:
+                f_perp = F - float(np.dot(F, d)) * d
+                cl_eff = float(np.linalg.norm(f_perp)) / max(float(meta["ref_area"]), 1e-12)
+                cdi = cl_eff * cl_eff / (math.pi * float(vortex_efficiency) * aspect_ratio)
+                f_ind = (cdi * float(meta["ref_area"])) * d
+                w_ind = np.maximum(np.abs(m), 0.05) * eff_area * exposure
+                if float(w_ind.sum()) > 1e-12:
+                    cp_ind = (cen * w_ind[:, None]).sum(0) / float(w_ind.sum())
+                else:
+                    cp_ind = cm_arr
+                F = F + f_ind
+                M = M + np.cross(cp_ind, f_ind)
+
+            first_hit = (exposure >= 1.0 - 1e-12).astype(float)
+            hit = np.maximum(m, 0.0) * eff_area * first_hit
+            Ag[i, j] = float(hit.sum())
+            shadow_w = (1.0 - exposure) * np.maximum(np.abs(m), 0.05) * eff_area
+            if float(shadow_w.sum()) > 1e-12:
+                Dg[i, j] = float((lag * shadow_w).sum() / shadow_w.sum())
+            Fg[i, j] = F
+            Mg[i, j] = M
 
     return {"alphas": alphas, "betas": betas, "Fg": Fg, "Mg": Mg,
+            "Ag": Ag, "Dg": Dg,
             "ref_area": float(meta["ref_area"]),
             "surface_area": float(meta["surface_area"]),
+            "aspect_ratio": float(aspect_ratio),
             "n_tri": int(len(tris)),
             "n_tri_original": int(meta["n_tri_original"]),
             "nose_x": float(meta["nose_x"]),
             "cm": [float(c) for c in np.asarray(cm)],
-            "occlusion": bool(occlusion), "shadow_bins": int(shadow_bins)}
+            "occlusion": bool(occlusion), "shadow_bins": int(shadow_bins),
+            "wake_decay": float(wake_decay),
+            "bernoulli_strength": float(bernoulli_strength),
+            "vortex_efficiency": float(vortex_efficiency)}
 
 
 def _bilinear(grid, alphas, betas, al, be):
@@ -229,6 +293,18 @@ def aero(model: dict, w_body: np.ndarray, q: float, cg_point):
     Mo = _bilinear(model["Mg"], model["alphas"], model["betas"], al, be) * q
     M = Mo - np.cross(np.asarray(cg_point, dtype=float), F)   # 무게중심으로 이동
     return F, M, al, be
+
+
+def ray_hit_area(model: dict, w_body: np.ndarray) -> float:
+    """현재 상대풍에서 ray가 실질적으로 충돌 가능한 투영 면적 [m^2]."""
+    al, be = ab_from_wind(w_body)
+    return float(_bilinear(model["Ag"], model["alphas"], model["betas"], al, be))
+
+
+def ray_wake_distance(model: dict, w_body: np.ndarray) -> float:
+    """현재 상대풍에서 첫 충돌면 뒤 wake 감쇠가 걸린 평균 거리 [m]."""
+    al, be = ab_from_wind(w_body)
+    return float(_bilinear(model["Dg"], model["alphas"], model["betas"], al, be))
 
 
 # ---------------------------------------------------------------------------

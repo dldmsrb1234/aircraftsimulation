@@ -1,136 +1,162 @@
 # -*- coding: utf-8 -*-
 """
-simulation.py
-=============
-시간에 따른 pitch / roll / yaw 자세 변화를 적분으로 계산한다.
+Ray-only STL flight simulation.
 
-회전 운동(각 축 독립, 감쇠 포함):
-    각가속도 = (모멘트 − 감쇠계수 · 각속도) / 관성모멘트
-    각속도  += 각가속도 · dt          (전진 오일러 적분)
-    각도    += 각속도   · dt
+The old parameterized wing/tail/CP physics path is intentionally gone.  A
+simulation run now requires an STL-derived ``panel_aero`` lookup model, and all
+forces and moments come from ray/panel aerodynamic samples on that model.
+
+``run_simulation`` still returns a finite trace because the Streamlit graphs
+need arrays.  The browser animation uses the same ray tables but has no time
+limit and keeps integrating until the user pauses or stops it.
 """
 
 from __future__ import annotations
-import math
+
 from dataclasses import dataclass
+import math
+
 import numpy as np
 
 from aircraft import Aircraft, Environment, InitialState, SimConfig
-import physics
+import panel_aero
 
 
 @dataclass
 class SimResult:
-    """시뮬레이션 결과 시계열(모두 numpy 배열, 각도는 deg)."""
+    """Finite analysis trace.  Angles and rates are stored in degrees."""
+
     t: np.ndarray
     pitch: np.ndarray
     roll: np.ndarray
     yaw: np.ndarray
-    aoa: np.ndarray          # 주날개 유효 받음각
-    cp: np.ndarray           # 양력중심 위치
+    aoa: np.ndarray
+    cp: np.ndarray
     L_wing: np.ndarray
     L_tail: np.ndarray
     M_pitch: np.ndarray
     M_roll: np.ndarray
     M_yaw: np.ndarray
-    pitch_rate: np.ndarray   # deg/s
+    ray_area: np.ndarray
+    ray_wake_distance: np.ndarray
+    pitch_rate: np.ndarray
     roll_rate: np.ndarray
     yaw_rate: np.ndarray
 
-    # 초기 자세(비교용, deg)
     pitch0: float = 0.0
     roll0: float = 0.0
     yaw0: float = 0.0
 
     def index_at(self, t_query: float) -> int:
-        """주어진 시각에 가장 가까운 배열 인덱스."""
         return int(np.clip(np.searchsorted(self.t, t_query), 0, len(self.t) - 1))
 
 
-def run_simulation(ac: Aircraft, env: Environment,
-                   init: InitialState, sim: SimConfig,
-                   aero_model=None) -> SimResult:
-    """전체 시뮬레이션 실행 후 SimResult 반환.
+def _dynamic_pressure(env: Environment) -> float:
+    return 0.5 * float(env.rho) * float(env.V) * float(env.V)
 
-    aero_model 이 주어지면 STL 표면 패널 공력으로 모멘트를 계산하고,
-    없으면 매개변수(면적·CP·CG) 모델을 사용한다.
-    """
-    n = int(round(sim.t_end / sim.dt)) + 1
-    n = max(n, 2)
 
-    # 상태 변수 (라디안)
-    theta = math.radians(init.pitch0_deg)   # pitch
-    phi = math.radians(init.roll0_deg)       # roll
-    psi = math.radians(init.yaw0_deg)        # yaw
-    q_rate = math.radians(init.q0_deg)       # pitch 각속도
-    p_rate = math.radians(init.p0_deg)       # roll  각속도
-    r_rate = math.radians(init.r0_deg)       # yaw   각속도
+def _ray_damping(k_raw: float, inertia: float, damping_mult: float) -> float:
+    """Use ray-derived static stiffness scale for numerical attitude damping."""
 
-    q_dyn = physics.dynamic_pressure(env.rho, env.V)
-    I_pitch, I_roll, I_yaw = ac.Iy, ac.Ix, ac.Iz
+    zeta = 0.4
+    return 2.0 * zeta * math.sqrt(max(abs(k_raw), 1e-12) * inertia) * damping_mult
 
-    # --- 모멘트 제공자: STL 패널 공력(aero_model) 또는 매개변수 모델 ---
-    if aero_model is not None:
-        import panel_aero
-        cg_point = panel_aero.cg_point_from_nose(aero_model, ac.cg)   # 슬라이더 CG 반영
-        k_th_raw = panel_aero.pitch_stiffness(aero_model, q_dyn, cg_point)
-        k_ps_raw = panel_aero.yaw_stiffness(aero_model, q_dyn, cg_point)
-        k_th = max(k_th_raw, 0.0)
-        k_ps = max(k_ps_raw, 0.0)
-        zeta = 0.4
-        cd_p = 2 * zeta * math.sqrt(max(k_th, 1e-12) * I_pitch) * sim.damping_mult
-        cd_y = 2 * zeta * math.sqrt(max(k_ps, 1e-12) * I_yaw) * sim.damping_mult
-        cd_r = I_roll * 3.0 * sim.damping_mult
 
-        def moments(th, ph, ps_):
-            w = panel_aero.relative_wind_body(th, ph, ps_)
-            F, M, al, _ = panel_aero.aero(aero_model, w, q_dyn, cg_point)
-            mr, mp, my = panel_aero.body_moments(M)
-            mr, mp, my = float(mr), float(mp), float(my)     # 순수 float 로 고정
-            fy = float(F[1])
-            fn = max(float(np.linalg.norm(F)), 1e-9)
-            if abs(fy) > max(1e-6, fn * 1e-4):
-                cp = float(np.clip(ac.cg - mp / fy, 0.0, max(ac.length, 1e-3)))
-            else:
-                cp = float("nan")
-            return mp, mr, my, (math.degrees(float(al)), cp, fy, float(-F[0]))
-    else:
-        cd_p = ac.cd_pitch * sim.damping_mult
-        cd_r = ac.cd_roll * sim.damping_mult
-        cd_y = ac.cd_yaw * sim.damping_mult
-        k_th = abs(physics.pitch_stiffness(ac, env, 0.0))
-        k_ps = abs(physics.yaw_stiffness(ac, env))
+def run_simulation(
+    ac: Aircraft,
+    env: Environment,
+    init: InitialState,
+    sim: SimConfig,
+    aero_model=None,
+) -> SimResult:
+    if aero_model is None:
+        raise ValueError("ray-only simulation requires an STL aero_model")
+    if sim.dt <= 0:
+        raise ValueError("simulation dt must be positive")
 
-        def moments(th, ph, ps_):
-            ps = physics.pitch_state(ac, env, th)
-            rs = physics.roll_moment(ac, env, ph)
-            ys = physics.yaw_moment(ac, env, ps_)
-            return (ps["M_pitch"], rs["M_roll"], ys["M_yaw"],
-                    (ps["alpha_wing_deg"], ps["x_cp"], ps["L_wing"], ps["L_tail"]))
+    n = max(int(round(max(sim.t_end, sim.dt) / sim.dt)) + 1, 2)
 
-    # 수치 안정성: ω·h<1.5 가 되도록 dt 를 내부 서브스텝으로 분할
-    if aero_model is not None:
-        k_freq_pitch = abs(k_th_raw)
-        k_freq_yaw = abs(k_ps_raw)
-    else:
-        k_freq_pitch = k_th
-        k_freq_yaw = k_ps
-    w_pitch = math.sqrt(k_freq_pitch / I_pitch) if I_pitch > 0 else 0.0
-    w_yaw = math.sqrt(k_freq_yaw / I_yaw) if I_yaw > 0 else 0.0
+    theta = math.radians(float(init.pitch0_deg))
+    phi = math.radians(float(init.roll0_deg))
+    psi = math.radians(float(init.yaw0_deg))
+    q_rate = math.radians(float(init.q0_deg))
+    p_rate = math.radians(float(init.p0_deg))
+    r_rate = math.radians(float(init.r0_deg))
+
+    q_dyn = _dynamic_pressure(env)
+    i_pitch = max(float(ac.Iy), 1e-12)
+    i_roll = max(float(ac.Ix), 1e-12)
+    i_yaw = max(float(ac.Iz), 1e-12)
+    cg_point = panel_aero.cg_point_from_nose(aero_model, float(ac.cg))
+
+    k_pitch_raw = float(panel_aero.pitch_stiffness(aero_model, q_dyn, cg_point))
+    k_yaw_raw = float(panel_aero.yaw_stiffness(aero_model, q_dyn, cg_point))
+    cd_pitch = _ray_damping(k_pitch_raw, i_pitch, float(sim.damping_mult))
+    cd_yaw = _ray_damping(k_yaw_raw, i_yaw, float(sim.damping_mult))
+    cd_roll = i_roll * 3.0 * float(sim.damping_mult)
+
+    def moments(th: float, ph: float, ps: float):
+        w_body = panel_aero.relative_wind_body(th, ph, ps)
+        force, moment_origin, alpha, _beta = panel_aero.aero(
+            aero_model, w_body, q_dyn, cg_point
+        )
+        m_roll, m_pitch, m_yaw = panel_aero.body_moments(moment_origin)
+        m_roll = float(m_roll)
+        m_pitch = float(m_pitch)
+        m_yaw = float(m_yaw)
+
+        fy = float(force[1])
+        f_norm = max(float(np.linalg.norm(force)), 1e-9)
+        if abs(fy) > max(1e-6, f_norm * 1e-4):
+            cp = float(np.clip(float(ac.cg) - m_pitch / fy, 0.0, max(float(ac.length), 1e-3)))
+        else:
+            cp = float("nan")
+
+        aux = (
+            math.degrees(float(alpha)),
+            cp,
+            fy,
+            float(-force[0]),
+            panel_aero.ray_hit_area(aero_model, w_body),
+            panel_aero.ray_wake_distance(aero_model, w_body),
+        )
+        return m_pitch, m_roll, m_yaw, aux
+
+    w_pitch = math.sqrt(abs(k_pitch_raw) / i_pitch) if i_pitch > 0 else 0.0
+    w_yaw = math.sqrt(abs(k_yaw_raw) / i_yaw) if i_yaw > 0 else 0.0
     w_max = max(w_pitch, w_yaw, 1e-9)
-    n_sub = int(min(200, max(1, math.ceil(sim.dt * w_max / 1.5))))
-    h = sim.dt / n_sub
+    n_sub = int(min(240, max(1, math.ceil(float(sim.dt) * w_max / 1.5))))
+    h = float(sim.dt) / n_sub
 
-    rec = {k: np.zeros(n) for k in (
-        "t", "pitch", "roll", "yaw", "aoa", "cp",
-        "L_wing", "L_tail", "M_pitch", "M_roll", "M_yaw",
-        "pitch_rate", "roll_rate", "yaw_rate")}
+    rec = {
+        key: np.zeros(n)
+        for key in (
+            "t",
+            "pitch",
+            "roll",
+            "yaw",
+            "aoa",
+            "cp",
+            "L_wing",
+            "L_tail",
+            "M_pitch",
+            "M_roll",
+            "M_yaw",
+            "ray_area",
+            "ray_wake_distance",
+            "pitch_rate",
+            "roll_rate",
+            "yaw_rate",
+        )
+    }
 
-    LO_T, HI_T, LIM = math.radians(-90), math.radians(90), math.radians(180)
+    def wrap_angle(a: float) -> float:
+        return math.atan2(math.sin(a), math.cos(a))
 
     for i in range(n):
-        mp, mr, my, aux = moments(theta, phi, psi)
-        rec["t"][i] = i * sim.dt
+        m_pitch, m_roll, m_yaw, aux = moments(theta, phi, psi)
+
+        rec["t"][i] = i * float(sim.dt)
         rec["pitch"][i] = math.degrees(theta)
         rec["roll"][i] = math.degrees(phi)
         rec["yaw"][i] = math.degrees(psi)
@@ -138,32 +164,43 @@ def run_simulation(ac: Aircraft, env: Environment,
         rec["cp"][i] = aux[1]
         rec["L_wing"][i] = aux[2]
         rec["L_tail"][i] = aux[3]
-        rec["M_pitch"][i] = mp
-        rec["M_roll"][i] = mr
-        rec["M_yaw"][i] = my
+        rec["M_pitch"][i] = m_pitch
+        rec["M_roll"][i] = m_roll
+        rec["M_yaw"][i] = m_yaw
+        rec["ray_area"][i] = aux[4]
+        rec["ray_wake_distance"][i] = aux[5]
         rec["pitch_rate"][i] = math.degrees(q_rate)
         rec["roll_rate"][i] = math.degrees(p_rate)
         rec["yaw_rate"][i] = math.degrees(r_rate)
 
-        # 반암시적 적분: rate=(rate+(M/I)·h)/(1+(c/I)·h)  (감쇠 무조건 안정)
         for _ in range(n_sub):
-            mp, mr, my, _ = moments(theta, phi, psi)
-            q_rate = (q_rate + (mp / I_pitch) * h) / (1.0 + (cd_p / I_pitch) * h)
-            p_rate = (p_rate + (mr / I_roll) * h) / (1.0 + (cd_r / I_roll) * h)
-            r_rate = (r_rate + (my / I_yaw) * h) / (1.0 + (cd_y / I_yaw) * h)
-            theta += q_rate * h
-            phi += p_rate * h
-            psi += r_rate * h
-            theta = LO_T if theta < LO_T else (HI_T if theta > HI_T else theta)
-            phi = -LIM if phi < -LIM else (LIM if phi > LIM else phi)
-            psi = -LIM if psi < -LIM else (LIM if psi > LIM else psi)
+            m_pitch, m_roll, m_yaw, _aux = moments(theta, phi, psi)
+            q_rate = (q_rate + (m_pitch / i_pitch) * h) / (1.0 + (cd_pitch / i_pitch) * h)
+            p_rate = (p_rate + (m_roll / i_roll) * h) / (1.0 + (cd_roll / i_roll) * h)
+            r_rate = (r_rate + (m_yaw / i_yaw) * h) / (1.0 + (cd_yaw / i_yaw) * h)
+
+            theta = wrap_angle(theta + q_rate * h)
+            phi = wrap_angle(phi + p_rate * h)
+            psi = wrap_angle(psi + r_rate * h)
 
     return SimResult(
-        t=rec["t"], pitch=rec["pitch"], roll=rec["roll"], yaw=rec["yaw"],
-        aoa=rec["aoa"], cp=rec["cp"],
-        L_wing=rec["L_wing"], L_tail=rec["L_tail"],
-        M_pitch=rec["M_pitch"], M_roll=rec["M_roll"], M_yaw=rec["M_yaw"],
-        pitch_rate=rec["pitch_rate"], roll_rate=rec["roll_rate"],
+        t=rec["t"],
+        pitch=rec["pitch"],
+        roll=rec["roll"],
+        yaw=rec["yaw"],
+        aoa=rec["aoa"],
+        cp=rec["cp"],
+        L_wing=rec["L_wing"],
+        L_tail=rec["L_tail"],
+        M_pitch=rec["M_pitch"],
+        M_roll=rec["M_roll"],
+        M_yaw=rec["M_yaw"],
+        ray_area=rec["ray_area"],
+        ray_wake_distance=rec["ray_wake_distance"],
+        pitch_rate=rec["pitch_rate"],
+        roll_rate=rec["roll_rate"],
         yaw_rate=rec["yaw_rate"],
-        pitch0=init.pitch0_deg, roll0=init.roll0_deg, yaw0=init.yaw0_deg,
+        pitch0=init.pitch0_deg,
+        roll0=init.roll0_deg,
+        yaw0=init.yaw0_deg,
     )

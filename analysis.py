@@ -17,7 +17,6 @@ analysis.py
 from __future__ import annotations
 import numpy as np
 
-import physics
 from aircraft import Aircraft, Environment
 from simulation import SimResult
 
@@ -115,10 +114,8 @@ def overall_assessment(ac: Aircraft, env: Environment, res: SimResult,
     r_label, r_lvl = roll_trend(res)
     y_label, y_lvl = yaw_trend(res)
 
-    k_theta = (physics.pitch_stiffness(ac, env, 0.0)
-               if k_theta_override is None else float(k_theta_override))
-    k_psi = (physics.yaw_stiffness(ac, env)
-             if k_psi_override is None else float(k_psi_override))
+    k_theta = 0.0 if k_theta_override is None else float(k_theta_override)
+    k_psi = 0.0 if k_psi_override is None else float(k_psi_override)
 
     # ---- 점수 구성 (각 항목 가중합) ----
     score = 0.0
@@ -165,7 +162,7 @@ def overall_assessment(ac: Aircraft, env: Environment, res: SimResult,
 
 def _ref_pitch_k(ac: Aircraft, env: Environment) -> float:
     """점수 정규화용 기준 강성 (q·S·c 규모)."""
-    q = physics.dynamic_pressure(env.rho, env.V)
+    q = 0.5 * env.rho * env.V * env.V
     return max(q * ac.wing.area * ac.length * 0.1, 1e-6)
 
 
