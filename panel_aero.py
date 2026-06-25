@@ -33,10 +33,24 @@ CD_SKIN = 0.018  # 표면 마찰/형상 drag 보정(동압 q 당)
 
 
 def _ensure_outward(tris: np.ndarray) -> np.ndarray:
+    tris = np.asarray(tris, dtype=float).copy()
     v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
     sv = np.einsum("ij,ij->i", v0, np.cross(v1, v2)).sum()
     if sv < 0:
         tris = tris[:, [0, 2, 1], :].copy()
+
+    # 전체 와인딩이 맞아도 일부 부품/패널만 뒤집힌 STL이 흔하다.
+    # 패널 중심이 형상 중심에서 뻗어나가는 방향과 법선이 크게 반대면 개별 보정한다.
+    v0, v1, v2 = tris[:, 0], tris[:, 1], tris[:, 2]
+    cen = (v0 + v1 + v2) / 3.0
+    nrm = np.cross(v1 - v0, v2 - v0)
+    center = tris.reshape(-1, 3).mean(0)
+    radial = cen - center
+    nr = np.linalg.norm(nrm, axis=1)
+    rr = np.linalg.norm(radial, axis=1)
+    flip = np.einsum("ij,ij->i", nrm, radial) < -1e-6 * np.maximum(nr * rr, 1.0)
+    if np.any(flip):
+        tris[flip] = tris[flip][:, [0, 2, 1], :]
     return tris
 
 
@@ -52,6 +66,9 @@ def _tri_props(tris):
 
 def _dir(al, be):
     """(α,β) → 기류 진행방향 단위벡터 (기체프레임). α=β=0 → (-1,0,0)."""
+    lim = math.radians(89.0)
+    al = max(-lim, min(lim, float(al)))
+    be = max(-lim, min(lim, float(be)))
     d = np.array([-1.0, math.tan(al), math.tan(be)])
     return d / np.linalg.norm(d)
 
@@ -108,6 +125,41 @@ def _visible_mask(cen: np.ndarray, area: np.ndarray, d: np.ndarray,
     return depth <= nearest[key] + tol
 
 
+def _reference_area(nhat: np.ndarray, area: np.ndarray) -> float:
+    """날개 기준면적에 가까운 planform 면적. 실패하면 표면적 기반 fallback."""
+    plan = float((np.maximum(0.0, nhat[:, 1]) * area).sum())
+    if plan > 1e-12:
+        return plan
+    proj = float((np.abs(nhat[:, 1]) * area).sum()) * 0.5
+    return proj if proj > 1e-12 else float(area.sum())
+
+
+def _sample_panels(tris: np.ndarray, max_tris: int):
+    """면적가중 샘플과 Horvitz-Thompson식 유효면적을 반환한다."""
+    cen_all, nhat_all, area_all = _tri_props(tris)
+    original_n = int(len(tris))
+    surface_area = float(area_all.sum())
+    nose_x = float(tris[:, :, 0].max())
+    ref_area = _reference_area(nhat_all, area_all)
+    if original_n <= max_tris or surface_area <= 1e-15:
+        return tris, cen_all, nhat_all, area_all, area_all, {
+            "n_tri_original": original_n, "surface_area": surface_area,
+            "ref_area": ref_area, "nose_x": nose_x,
+        }
+
+    rng = np.random.default_rng(0)
+    p = area_all / surface_area
+    idx = rng.choice(original_n, max_tris, replace=True, p=p)
+    tris_s = tris[idx]
+    cen, nhat, area = _tri_props(tris_s)
+    # p_i=area_i/surface_area 이므로 area_i/(n*p_i)=surface_area/n.
+    eff_area = np.full(len(idx), surface_area / float(max_tris), dtype=float)
+    return tris_s, cen, nhat, area, eff_area, {
+        "n_tri_original": original_n, "surface_area": surface_area,
+        "ref_area": ref_area, "nose_x": nose_x,
+    }
+
+
 def ab_from_wind(w):
     """기체프레임 상대풍 단위벡터 → (α, β) [rad]."""
     dx, dy, dz = float(w[0]), float(w[1]), float(w[2])
@@ -116,7 +168,7 @@ def ab_from_wind(w):
 
 def build_aero_model(tris: np.ndarray, cm: np.ndarray,
                      n_alpha: int = 41, n_beta: int = 17,
-                     a_max: float = 45.0, b_max: float = 35.0,
+                     a_max: float = 89.0, b_max: float = 89.0,
                      max_tris: int = 60000,
                      occlusion: bool = True,
                      shadow_bins: int = 80) -> dict:
@@ -126,10 +178,7 @@ def build_aero_model(tris: np.ndarray, cm: np.ndarray,
     cm : 정렬프레임 부피중심(무게중심의 y,z 기본값 및 기준점 표시용).
     """
     tris = _ensure_outward(np.asarray(tris, dtype=float))
-    if len(tris) > max_tris:                       # 과대 메시는 샘플링
-        idx = np.random.default_rng(0).choice(len(tris), max_tris, replace=False)
-        tris = tris[idx]
-    cen, nhat, area = _tri_props(tris)              # r = 원점 기준 = cen
+    tris, cen, nhat, geom_area, eff_area, meta = _sample_panels(tris, max_tris)
 
     alphas = np.radians(np.linspace(-a_max, a_max, n_alpha))
     betas = np.radians(np.linspace(-b_max, b_max, n_beta))
@@ -142,18 +191,21 @@ def build_aero_model(tris: np.ndarray, cm: np.ndarray,
             m = -(nhat @ d)                         # >0 windward
             Cp = _pressure_cp(m)
             if occlusion:
-                visible = _visible_mask(cen, area, d, shadow_bins)
-                Cp = np.where((m > 0.0) & (~visible), 0.0, Cp)
+                visible = _visible_mask(cen, geom_area, d, shadow_bins)
+                Cp = np.where(visible, Cp, 0.0)
             else:
-                visible = np.ones(len(area), dtype=bool)
-            f = (-(Cp * area))[:, None] * nhat      # q 당 패널 힘
-            f += (CD_SKIN * area * visible)[:, None] * d
+                visible = np.ones(len(eff_area), dtype=bool)
+            f = (-(Cp * eff_area))[:, None] * nhat      # q 당 패널 힘
+            f += (CD_SKIN * eff_area * visible)[:, None] * d
             Fg[i, j] = f.sum(0)
             Mg[i, j] = np.cross(cen, f).sum(0)      # 원점 기준 모멘트
 
     return {"alphas": alphas, "betas": betas, "Fg": Fg, "Mg": Mg,
-            "ref_area": float(area.sum()), "n_tri": int(len(tris)),
-            "nose_x": float(tris[:, :, 0].max()),
+            "ref_area": float(meta["ref_area"]),
+            "surface_area": float(meta["surface_area"]),
+            "n_tri": int(len(tris)),
+            "n_tri_original": int(meta["n_tri_original"]),
+            "nose_x": float(meta["nose_x"]),
             "cm": [float(c) for c in np.asarray(cm)],
             "occlusion": bool(occlusion), "shadow_bins": int(shadow_bins)}
 
@@ -223,7 +275,11 @@ def body_moments(M):
 def cg_point_from_nose(model, cg_from_nose):
     """무게중심(기수 기준 스칼라) → 정렬프레임 무게중심점 [x,y,z]."""
     cm = model["cm"]
-    return np.array([model["nose_x"] - cg_from_nose, cm[1], cm[2]])
+    return np.array([
+        model["nose_x"] - cg_from_nose,
+        float(model.get("cg_y", cm[1])),
+        float(model.get("cg_z", cm[2])),
+    ])
 
 
 def pitch_stiffness(model, env_q, cg_point, theta0=0.0, eps=math.radians(3.0)):

@@ -41,6 +41,8 @@ def aoa_status(aoa_deg: float) -> tuple[str, str]:
 
 def cp_cg_relation(x_cp: float, x_cg: float, length: float) -> tuple[str, str]:
     """양력중심(CP) 과 무게중심(CG) 의 전후 관계."""
+    if not np.isfinite(x_cp):
+        return "CP 계산 불안정", WARN
     margin = (x_cp - x_cg) / max(length, 1e-6)   # 길이로 정규화한 정적여유 근사
     if margin > 0.01:
         return "CP가 CG보다 뒤 (세로 안정)", OK

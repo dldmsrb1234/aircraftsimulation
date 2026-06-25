@@ -73,8 +73,10 @@ def run_simulation(ac: Aircraft, env: Environment,
     if aero_model is not None:
         import panel_aero
         cg_point = panel_aero.cg_point_from_nose(aero_model, ac.cg)   # 슬라이더 CG 반영
-        k_th = abs(panel_aero.pitch_stiffness(aero_model, q_dyn, cg_point))
-        k_ps = abs(panel_aero.yaw_stiffness(aero_model, q_dyn, cg_point))
+        k_th_raw = panel_aero.pitch_stiffness(aero_model, q_dyn, cg_point)
+        k_ps_raw = panel_aero.yaw_stiffness(aero_model, q_dyn, cg_point)
+        k_th = max(k_th_raw, 0.0)
+        k_ps = max(k_ps_raw, 0.0)
         zeta = 0.4
         cd_p = 2 * zeta * math.sqrt(max(k_th, 1e-12) * I_pitch) * sim.damping_mult
         cd_y = 2 * zeta * math.sqrt(max(k_ps, 1e-12) * I_yaw) * sim.damping_mult
@@ -85,9 +87,13 @@ def run_simulation(ac: Aircraft, env: Environment,
             F, M, al, _ = panel_aero.aero(aero_model, w, q_dyn, cg_point)
             mr, mp, my = panel_aero.body_moments(M)
             mr, mp, my = float(mr), float(mp), float(my)     # 순수 float 로 고정
-            fy = float(F[1]) if abs(float(F[1])) > 1e-6 else 1e-6
-            cp = float(np.clip(ac.cg - mp / fy, 0.0, max(ac.length, 1e-3)))
-            return mp, mr, my, (math.degrees(float(al)), cp, float(F[1]), float(-F[0]))
+            fy = float(F[1])
+            fn = max(float(np.linalg.norm(F)), 1e-9)
+            if abs(fy) > max(1e-6, fn * 1e-4):
+                cp = float(np.clip(ac.cg - mp / fy, 0.0, max(ac.length, 1e-3)))
+            else:
+                cp = float("nan")
+            return mp, mr, my, (math.degrees(float(al)), cp, fy, float(-F[0]))
     else:
         cd_p = ac.cd_pitch * sim.damping_mult
         cd_r = ac.cd_roll * sim.damping_mult
@@ -103,8 +109,14 @@ def run_simulation(ac: Aircraft, env: Environment,
                     (ps["alpha_wing_deg"], ps["x_cp"], ps["L_wing"], ps["L_tail"]))
 
     # 수치 안정성: ω·h<1.5 가 되도록 dt 를 내부 서브스텝으로 분할
-    w_pitch = math.sqrt(k_th / I_pitch) if I_pitch > 0 else 0.0
-    w_yaw = math.sqrt(k_ps / I_yaw) if I_yaw > 0 else 0.0
+    if aero_model is not None:
+        k_freq_pitch = abs(k_th_raw)
+        k_freq_yaw = abs(k_ps_raw)
+    else:
+        k_freq_pitch = k_th
+        k_freq_yaw = k_ps
+    w_pitch = math.sqrt(k_freq_pitch / I_pitch) if I_pitch > 0 else 0.0
+    w_yaw = math.sqrt(k_freq_yaw / I_yaw) if I_yaw > 0 else 0.0
     w_max = max(w_pitch, w_yaw, 1e-9)
     n_sub = int(min(200, max(1, math.ceil(sim.dt * w_max / 1.5))))
     h = sim.dt / n_sub

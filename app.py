@@ -65,13 +65,15 @@ def badge(text: str, level: str) -> str:
 def stl_signature(raw: bytes, unit_label: str, physics_scale: float,
                   quality: str, pre_rot: tuple[float, float, float],
                   mass: float, cg_mode: str, cg_ratio: float | None,
-                  cg_m: float | None) -> str:
+                  cg_m: float | None, cg_y_offset: float,
+                  cg_z_offset: float) -> str:
     h = hashlib.sha1(raw).hexdigest()[:16]
     rx, ry, rz = pre_rot
     cg_ratio_s = "" if cg_ratio is None else f"{float(cg_ratio):.6g}"
     cg_m_s = "" if cg_m is None else f"{float(cg_m):.6g}"
     return (f"{h}:{unit_label}:{physics_scale:.6g}:{quality}:{float(mass):.6g}:"
-            f"{cg_mode}:{cg_ratio_s}:{cg_m_s}:{rx:.3f}:{ry:.3f}:{rz:.3f}")
+            f"{cg_mode}:{cg_ratio_s}:{cg_m_s}:{float(cg_y_offset):.6g}:"
+            f"{float(cg_z_offset):.6g}:{rx:.3f}:{ry:.3f}:{rz:.3f}")
 
 
 def stl_preview_chart_key(stl_sig: str, cur_values: dict) -> str:
@@ -80,13 +82,17 @@ def stl_preview_chart_key(stl_sig: str, cur_values: dict) -> str:
     return "stl_preview_" + hashlib.sha1(f"{stl_sig}:{live}".encode()).hexdigest()[:16]
 
 
-def inertia_with_cg_override(props: dict, mass: float, cg_from_nose: float) -> tuple[float, float, float]:
+def inertia_with_cg_override(props: dict, mass: float, cg_from_nose: float,
+                             cg_y_offset: float = 0.0,
+                             cg_z_offset: float = 0.0) -> tuple[float, float, float]:
     """균일밀도 CM 기준 관성을 사용자가 고른 CG 기준으로 이동."""
     dx = float(cg_from_nose) - float(props["cg"])
+    dy = float(cg_y_offset)
+    dz = float(cg_z_offset)
     return (
-        max(float(props["Ix"]), 1e-9),
-        max(float(props["Iy"]) + mass * dx * dx, 1e-9),
-        max(float(props["Iz"]) + mass * dx * dx, 1e-9),
+        max(float(props["Ix"]) + mass * (dy * dy + dz * dz), 1e-9),
+        max(float(props["Iy"]) + mass * (dx * dx + dy * dy), 1e-9),
+        max(float(props["Iz"]) + mass * (dx * dx + dz * dz), 1e-9),
     )
 
 
@@ -135,15 +141,19 @@ def moment_direction(axis: str, moment: float) -> str:
 def make_stl_preview(raw: bytes, unit_factor: float, mass: float,
                      cg_mode: str, cg_ratio: float | None,
                      cg_m: float | None, cur_values: dict,
-                     pre_rot: tuple[float, float, float]) -> dict:
+                     pre_rot: tuple[float, float, float],
+                     cg_y_offset: float, cg_z_offset: float) -> dict:
     tris = stl_analysis.parse_stl(raw) * unit_factor
     rotated = stl_analysis.rotate_mesh(tris, *pre_rot)
     props = stl_analysis.analyze(rotated, "+X", "+Y", mass)
     cg_from_nose = cg_from_stl_settings(
         props, cg_mode, float(cur_values["cg"]), cg_ratio, cg_m)
-    Ix, Iy, Iz = inertia_with_cg_override(props, mass, cg_from_nose)
+    Ix, Iy, Iz = inertia_with_cg_override(
+        props, mass, cg_from_nose, cg_y_offset, cg_z_offset)
     model = panel_aero.build_aero_model(
         rotated, np.asarray(props["cm"]), **STL_PREVIEW_QUALITY)
+    model["cg_y"] = float(props["cm"][1]) + float(cg_y_offset)
+    model["cg_z"] = float(props["cm"][2]) + float(cg_z_offset)
     q_dyn = physics.dynamic_pressure(float(cur_values["rho"]), float(cur_values["V"]))
     cgp = panel_aero.cg_point_from_nose(model, cg_from_nose)
     k_pitch = panel_aero.pitch_stiffness(model, q_dyn, cgp)
@@ -177,6 +187,7 @@ def make_stl_preview(raw: bytes, unit_factor: float, mass: float,
     props = dict(props)
     props.update({
         "cg_applied": cg_from_nose, "cg_auto": float(props["cg"]),
+        "cg_y_applied": model["cg_y"], "cg_z_applied": model["cg_z"],
         "Ix": Ix, "Iy": Iy, "Iz": Iz, "alpha_preview": math.degrees(float(alpha)),
         "beta_preview": math.degrees(float(beta)), "L_preview": float(F[1]),
         "D_preview": float(-F[0]), "n_tri_preview": int(model["n_tri"]),
@@ -335,6 +346,15 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
     stl_cg_m = st.number_input("CG 위치 (기수 기준, m)", min_value=0.0,
                                value=float(st.session_state.get("stl_cg_m", st.session_state["cg"])),
                                key="stl_cg_m", format="%.4f") if stl_cg_mode == "기수 기준 거리(m)" else None
+    cg_o1, cg_o2 = st.columns(2)
+    stl_cg_y_offset = cg_o1.number_input(
+        "CG 높이 오프셋 (m, +위)",
+        value=float(st.session_state.get("stl_cg_y_offset", 0.0)),
+        step=0.001, key="stl_cg_y_offset", format="%.4f")
+    stl_cg_z_offset = cg_o2.number_input(
+        "CG 좌우 오프셋 (m, +우)",
+        value=float(st.session_state.get("stl_cg_z_offset", 0.0)),
+        step=0.001, key="stl_cg_z_offset", format="%.4f")
     stl_quality = st.selectbox("ray 물리 정밀도", list(STL_QUALITY.keys()), index=1, key="stl_quality")
     stl_show_preview = st.checkbox("적용 전 3D 진단 표시", value=True, key="stl_preview_on")
 
@@ -349,7 +369,8 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                        "이진(binary) STL / 폴리곤 수 줄인 모델 권장.")
         stl_sig_current = stl_signature(
             raw, unit_label, stl_physics_scale, stl_quality, stl_pre_rot,
-            float(stl_mass), stl_cg_mode, stl_cg_ratio, stl_cg_m)
+            float(stl_mass), stl_cg_mode, stl_cg_ratio, stl_cg_m,
+            float(stl_cg_y_offset), float(stl_cg_z_offset))
         applied_sig = st.session_state.get("_aero_signature")
         if applied_sig and applied_sig != stl_sig_current:
             st.info("STL 파일/단위/질량/물리 크기/초기 방향 각도/CG/정밀도 설정이 바뀌었습니다. "
@@ -361,7 +382,8 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 stl_preview = make_stl_preview(
                     raw, _UNIT[unit_label] * float(stl_physics_scale),
                     float(stl_mass), stl_cg_mode, stl_cg_ratio, stl_cg_m,
-                    preview_cur, stl_pre_rot)
+                    preview_cur, stl_pre_rot,
+                    float(stl_cg_y_offset), float(stl_cg_z_offset))
             except Exception as e:
                 stl_preview_error = f"{type(e).__name__}: {e}"
                 st.warning(f"적용 전 3D 진단 생성 실패: {stl_preview_error}")
@@ -376,7 +398,9 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                     props, stl_cg_mode, float(st.session_state["cg"]),
                     stl_cg_ratio, stl_cg_m)
 
-                Ix, Iy, Iz = inertia_with_cg_override(props, float(stl_mass), cg_from_nose)
+                Ix, Iy, Iz = inertia_with_cg_override(
+                    props, float(stl_mass), cg_from_nose,
+                    float(stl_cg_y_offset), float(stl_cg_z_offset))
                 keys = ["length", "span", "height", "S_wing", "wing_pos", "cp_base",
                         "S_htail", "htail_arm", "S_vtail", "vtail_arm"]
                 geo = {k: float(props[k]) for k in keys}
@@ -390,12 +414,14 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
                 # 표면 패널 공력 모델 생성(정렬 메시 + 무게중심점)
                 aero_model = panel_aero.build_aero_model(
                     V, np.asarray(props["cm"]), **STL_QUALITY[stl_quality])
+                aero_model["cg_y"] = float(props["cm"][1]) + float(stl_cg_y_offset)
+                aero_model["cg_z"] = float(props["cm"][2]) + float(stl_cg_z_offset)
                 q0 = 0.5 * float(st.session_state["rho"]) * float(st.session_state["V"]) ** 2
                 cgp = panel_aero.cg_point_from_nose(aero_model, geo["cg"])
                 props["k_theta_panel"] = panel_aero.pitch_stiffness(aero_model, q0, cgp)
                 props["k_psi_panel"] = panel_aero.yaw_stiffness(aero_model, q0, cgp)
-                k_th = max(abs(props["k_theta_panel"]), 1e-12)
-                k_ps = max(abs(props["k_psi_panel"]), 1e-12)
+                k_th = max(float(props["k_theta_panel"]), 1e-12)
+                k_ps = max(float(props["k_psi_panel"]), 1e-12)
                 zeta = 0.38   # 목표 감쇠비(가볍게 진동하며 수렴)
                 geo["cd_pitch"] = 2 * zeta * math.sqrt(k_th * geo["Iy"])
                 geo["cd_yaw"] = 2 * zeta * math.sqrt(k_ps * geo["Iz"])
@@ -403,6 +429,8 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
 
                 props["cg_auto"] = float(props["cg"])
                 props["cg_applied"] = float(cg_from_nose)
+                props["cg_y_applied"] = float(aero_model["cg_y"])
+                props["cg_z_applied"] = float(aero_model["cg_z"])
                 props["mass"] = float(stl_mass)
                 props["Ix"], props["Iy"], props["Iz"] = geo["Ix"], geo["Iy"], geo["Iz"]
                 props["static_margin"] = geo["cp_base"] - geo["cg"]
@@ -421,12 +449,17 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
 
         rp = st.session_state.get("_stl_report")
         if rp:
+            ray_n = st.session_state.get("_aero_model", {}).get("n_tri")
+            ray_src = st.session_state.get("_aero_model", {}).get("n_tri_original")
+            ray_note = f" · ray 패널 {ray_n:,}/{ray_src:,}개" if ray_n and ray_src else ""
             st.success(
-                f"추출됨(형상 기반 추정) · 삼각형 {rp['n_tri']:,}개 · ray {rp.get('quality', '기본')}\n\n"
+                f"추출됨(형상 기반 추정) · 삼각형 {rp['n_tri']:,}개 · ray {rp.get('quality', '기본')}{ray_note}\n\n"
                 f"- 길이 {rp['length']:.3g} m · 날개폭 {rp['span']:.3g} m · 높이 {rp['height']:.3g} m\n"
                 f"- 주날개 면적 {rp['S_wing']:.3g} m² · 수평꼬리 {rp['S_htail']:.2g} m²\n"
                 f"- CG {rp.get('cg_applied', rp['cg']):.3g} m "
                 f"(자동 추정 {rp.get('cg_auto', rp['cg']):.3g} m) · CP {rp['cp_base']:.3g} m\n"
+                f"- CG 3D 기준점 y/z = {rp.get('cg_y_applied', 0):.3g} / "
+                f"{rp.get('cg_z_applied', 0):.3g} m\n"
                 f"- 물리 크기 배율 {rp.get('physics_scale', 1.0):.2f}×\n"
                 f"- 초기 방향 Roll/Pitch/Yaw = {rp.get('pre_rot', [0, 0, 0])[0]:.0f}° / "
                 f"{rp.get('pre_rot', [0, 0, 0])[2]:.0f}° / {rp.get('pre_rot', [0, 0, 0])[1]:.0f}°\n"
@@ -635,9 +668,16 @@ with tab_graph:
     g3.plotly_chart(viz.time_series_figure(
         res.t, [(res.cp, "CP 위치", "#8c564b")], "양력중심(CP) 위치", "x_cp (m)", t_now),
         width='stretch')
+    if sim_data.get("aero"):
+        force_series = [(res.L_wing, "총 수직력 Fy", "#2ca02c"),
+                        (res.L_tail, "드래그 D", "#ff7f0e")]
+        force_title = "ray 공력"
+    else:
+        force_series = [(res.L_wing, "주날개", "#2ca02c"),
+                        (res.L_tail, "꼬리날개", "#ff7f0e")]
+        force_title = "양력"
     g4.plotly_chart(viz.time_series_figure(
-        res.t, [(res.L_wing, "주날개", "#2ca02c"), (res.L_tail, "꼬리날개", "#ff7f0e")],
-        "양력", "양력 (N)", t_now), width='stretch')
+        res.t, force_series, force_title, "힘 (N)", t_now), width='stretch')
     g5, g6 = st.columns(2)
     g5.plotly_chart(viz.time_series_figure(
         res.t, [(res.M_pitch, "M_pitch", "#1f77b4")], "Pitch 모멘트", "N·m", t_now),

@@ -30,8 +30,10 @@ def _build_dyn(ac, env, init, sim, aero_model) -> dict:
     if aero_model is not None:
         import panel_aero
         cgp = panel_aero.cg_point_from_nose(aero_model, ac.cg)
-        k_th = abs(panel_aero.pitch_stiffness(aero_model, q, cgp))
-        k_ps = abs(panel_aero.yaw_stiffness(aero_model, q, cgp))
+        k_th_raw = panel_aero.pitch_stiffness(aero_model, q, cgp)
+        k_ps_raw = panel_aero.yaw_stiffness(aero_model, q, cgp)
+        k_th = max(k_th_raw, 0.0)
+        k_ps = max(k_ps_raw, 0.0)
         zeta = 0.4
         cd_p = 2 * zeta * math.sqrt(max(k_th, 1e-12) * I_pitch) * mult
         cd_y = 2 * zeta * math.sqrt(max(k_ps, 1e-12) * I_yaw) * mult
@@ -62,9 +64,11 @@ def _build_dyn(ac, env, init, sim, aero_model) -> dict:
             "vtail_arm": ac.vtail.arm,
         }
         mode = "param"
+        k_th_raw = k_th
+        k_ps_raw = k_ps
 
-    w_pitch = math.sqrt(k_th / I_pitch) if I_pitch > 0 else 0.0
-    w_yaw = math.sqrt(k_ps / I_yaw) if I_yaw > 0 else 0.0
+    w_pitch = math.sqrt(abs(k_th_raw) / I_pitch) if I_pitch > 0 else 0.0
+    w_yaw = math.sqrt(abs(k_ps_raw) / I_yaw) if I_yaw > 0 else 0.0
     scale_guard = 2.0 if aero_model is not None else 1.0  # UI 크기 배율 4x → ω roughly 2x
     n_sub = int(min(300, max(1, math.ceil(sim.dt * max(w_pitch, w_yaw, 1e-9) * scale_guard / 1.5))))
 
