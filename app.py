@@ -42,6 +42,8 @@ STL_QUALITY = {
 }
 STL_PREVIEW_QUALITY = dict(n_alpha=21, n_beta=9, max_tris=18000,
                            occlusion=True, shadow_bins=50)
+DEFAULT_STL_FWD = "+X"
+DEFAULT_STL_UP = "+Z"   # most CAD/STL aircraft exports are Z-up; app frame is Y-up
 
 
 # ---------------------------------------------------------------------------
@@ -71,7 +73,8 @@ def stl_signature(raw: bytes, unit_label: str, physics_scale: float,
     rx, ry, rz = pre_rot
     cg_ratio_s = "" if cg_ratio is None else f"{float(cg_ratio):.6g}"
     cg_m_s = "" if cg_m is None else f"{float(cg_m):.6g}"
-    return (f"{h}:{unit_label}:{physics_scale:.6g}:{quality}:{float(mass):.6g}:"
+    return (f"{h}:{DEFAULT_STL_FWD}:{DEFAULT_STL_UP}:"
+            f"{unit_label}:{physics_scale:.6g}:{quality}:{float(mass):.6g}:"
             f"{cg_mode}:{cg_ratio_s}:{cg_m_s}:{float(cg_y_offset):.6g}:"
             f"{float(cg_z_offset):.6g}:{rx:.3f}:{ry:.3f}:{rz:.3f}")
 
@@ -144,7 +147,8 @@ def make_stl_preview(raw: bytes, unit_factor: float, mass: float,
                      pre_rot: tuple[float, float, float],
                      cg_y_offset: float, cg_z_offset: float) -> dict:
     tris = stl_analysis.parse_stl(raw) * unit_factor
-    rotated = stl_analysis.rotate_mesh(tris, *pre_rot)
+    aligned = stl_analysis.align_mesh(tris, DEFAULT_STL_FWD, DEFAULT_STL_UP)
+    rotated = stl_analysis.rotate_mesh(aligned, *pre_rot)
     props = stl_analysis.analyze(rotated, "+X", "+Y", mass)
     cg_from_nose = cg_from_stl_settings(
         props, cg_mode, float(cur_values["cg"]), cg_ratio, cg_m)
@@ -307,7 +311,7 @@ with st.sidebar.expander("🔧 관성 / 감쇠 / 시간 (심화)"):
     st.slider("시간 간격 dt (s)", 0.005, 0.1, step=0.005, key="dt")
 
 stl_b64 = ""
-stl_fwd, stl_up = "+X", "+Y"
+stl_fwd, stl_up = DEFAULT_STL_FWD, DEFAULT_STL_UP
 stl_sig_current = None
 stl_preview = None
 stl_preview_error = None
@@ -325,7 +329,7 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
         "물리 크기 배율 (ray/면적/관성에 반영)", 0.10, 5.00, step=0.05,
         value=float(st.session_state.get("stl_physics_scale", 1.0)),
         key="stl_physics_scale")
-    st.caption("초기 STL 방향 설정: 각도 숫자를 바꾸면 적용 전 3D 진단이 즉시 갱신됩니다.")
+    st.caption("초기 STL 방향 설정: 기본은 CAD/STL 표준에 가까운 X=전방, Z=위로 맞추고 숫자 각도로 보정합니다.")
     r_roll, r_pitch, r_yaw = st.columns(3)
     stl_init_roll = r_roll.number_input(
         "Roll (deg)", value=float(st.session_state.get("stl_init_roll", 0.0)),
@@ -392,7 +396,8 @@ with st.sidebar.expander("🛩️ 3D 모델 (STL 업로드 + 형상 분석)"):
             try:
                 factor = _UNIT[unit_label] * float(stl_physics_scale)
                 tris = stl_analysis.parse_stl(raw) * factor
-                V = stl_analysis.rotate_mesh(tris, *stl_pre_rot)
+                aligned = stl_analysis.align_mesh(tris, stl_fwd, stl_up)
+                V = stl_analysis.rotate_mesh(aligned, *stl_pre_rot)
                 props = stl_analysis.analyze(V, "+X", "+Y", float(stl_mass))
                 cg_from_nose = cg_from_stl_settings(
                     props, stl_cg_mode, float(st.session_state["cg"]),
